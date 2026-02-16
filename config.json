@@ -1,0 +1,78 @@
+{
+    "api_key": "YOUR_KRAKEN_API_KEY",
+    "api_secret": "YOUR_KRAKEN_API_SECRET",
+    "pair": "XETHZUSD",
+    "asset": "ETH",
+    "currency": "ZUSD",
+
+    "strategy": "adaptive",
+
+    "grid_levels": 6,
+    "grid_spacing_pct": 1.75,
+    "grid_alloc_pct": 60.0,
+
+    "dip_threshold_pct": 3.0,
+    "dip_buy_pct": 20.0,
+    "dip_tp_pct": 1.75,
+    "dip_cooldown_sec": 300,
+
+    "scalp_vol_pct": 0.5,
+    "scalp_vol_lookback_sec": 120,
+    "scalp_buy_offset_pct": 0.15,
+    "scalp_tp_pct": 0.75,
+    "scalp_size_pct": 10.0,
+    "scalp_timeout_sec": 120,
+    "scalp_cooldown_sec": 180,
+
+    "adaptive_ma_period": 1440,
+    "adaptive_trend_threshold_up": 3.0,
+    "adaptive_trend_threshold_down": 5.0,
+    "adaptive_regime_confirmation_cycles": 3,
+
+    "polymarket_enabled": true,
+    "polymarket_weight": 0.3,
+    "polymarket_cache_minutes": 15,
+    "polymarket_keywords": ["ethereum", "ETH", "crypto", "bitcoin", "BTC"],
+
+    "sentiment_sources": {
+        "polymarket": true,
+        "messari": true,
+        "fear_greed": true,
+        "market_data": true
+    },
+    "sentiment_weights": {
+        "polymarket": 0.3,
+        "messari": 0.25,
+        "fear_greed": 0.25,
+        "market_data": 0.2
+    },
+
+    "daily_max_loss_usd": 30.0,
+    "stop_loss_equity": 60.0,
+    "take_profit_equity": 500.0,
+    "check_interval_sec": 60,
+    "log_file": "trades.log",
+
+    "rl_enabled": true,
+    "rl_learning_rate": 0.1,
+    "rl_discount_factor": 0.95,
+    "rl_exploration_rate": 0.2,
+    "rl_min_trades_before_tuning": 20,
+    "rl_history_file": "trade_history.json",
+    "rl_qtable_file": "q_table.json",
+
+    "warmup_enabled": true,
+    "warmup_stale_hours": 24,
+    "warmup_rampup_hours": 48,
+    "warmup_qtable_decay_30d": 0.8,
+    "warmup_qtable_decay_90d": 0.5,
+    "warmup_qtable_reset_days": 180,
+
+    "pruning_enabled": true,
+    "pruning_max_trades": 500,
+    "pruning_max_file_mb": 5,
+    "pruning_cycle_interval": 50,
+    "pruning_keep_recent_days": 7,
+    "pruning_pattern_min_occurrences": 5,
+    "pruning_qtable_stale_days": 30
+}
