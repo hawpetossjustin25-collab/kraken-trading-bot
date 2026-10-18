@@ -1,0 +1,694 @@
+import json
+import os
+
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+rep = json.load(open(os.path.join(BOT_DIR, "data_engine_report.json"), encoding="utf-8"))
+
+embedded = {
+    "generated": rep.get("generated", ""),
+    "assets_tracked": rep.get("assets_tracked", 434),
+    "closed_positions": rep.get("closed_positions", 95041),
+    "consistent_winners": rep.get("consistent_winners", [])[:15],
+    "last_month_top": rep.get("last_month_top", [])[:15],
+    "this_month_top": rep.get("this_month_top", [])[:15],
+    "pnl_by_strategy": rep.get("pnl_by_strategy", {}),
+    "pnl_by_regime": rep.get("pnl_by_regime", {}),
+    "pnl_by_hour_utc": rep.get("pnl_by_hour_utc", {}),
+    "pnl_by_day_of_month": rep.get("pnl_by_day_of_month", {}),
+    "floor_accuracy": dict(sorted(
+        rep.get("floor_accuracy", {}).items(),
+        key=lambda kv: (-kv[1].get("held", 0), -kv[1].get("rate", 0))
+    )[:15]),
+}
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b1220">
+<title>Kraken Adaptive Bot & Data Engine</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b1220; color: #e2e8f0; min-height: 100vh; padding-bottom: 60px; }
+.wrap { max-width: 820px; margin: 0 auto; padding: 12px; }
+header { background: linear-gradient(135deg, #131f37, #1e293b); border: 1px solid #334155; border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+header h1 { font-size: 17px; color: #38bdf8; }
+header .sub { font-size: 11px; color: #94a3b8; margin-top: 2px; }
+.badge { background: #065f46; color: #6ee7b7; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+.badge.warn { background: #78350f; color: #fde68a; }
+.tabs { display: flex; gap: 5px; margin-bottom: 10px; overflow-x: auto; }
+.tab { flex: 1; text-align: center; background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 8px; padding: 9px 6px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.tab.active { background: #0284c7; color: #fff; border-color: #38bdf8; }
+.card { background: #131f37; border: 1px solid #263554; border-radius: 10px; padding: 12px; margin-bottom: 10px; }
+.card h2 { font-size: 13px; color: #38bdf8; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+.stat { background: #0b1220; border: 1px solid #1e293b; border-radius: 8px; padding: 9px; }
+.stat .lbl { font-size: 10px; color: #94a3b8; text-transform: uppercase; }
+.stat .val { font-size: 16px; font-weight: 700; margin-top: 2px; }
+.pos { color: #34d399; }
+.neg { color: #f87171; }
+.warn { color: #fbbf24; }
+select, input { width: 100%; background: #0b1220; color: #e2e8f0; border: 1px solid #334155; border-radius: 8px; padding: 9px; font-size: 14px; margin-bottom: 8px; }
+.btn-row { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.btn { flex: 1; border: none; border-radius: 8px; padding: 10px; font-size: 13px; font-weight: 700; color: #fff; cursor: pointer; }
+.btn.buy { background: #059669; }
+.btn.sell { background: #dc2626; }
+.btn.blue { background: #0284c7; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { padding: 6px 5px; text-align: left; border-bottom: 1px solid #1e293b; }
+th { color: #94a3b8; font-size: 10px; text-transform: uppercase; }
+.gauge { height: 7px; background: #1e293b; border-radius: 4px; overflow: hidden; margin-top: 5px; }
+.gauge > div { height: 100%; background: linear-gradient(90deg, #f87171, #fbbf24, #34d399); transition: width .3s; }
+.logbox { background: #070b14; border: 1px solid #1e293b; border-radius: 8px; padding: 8px; font-family: monospace; font-size: 11px; color: #cbd5e1; max-height: 180px; overflow-y: auto; line-height: 1.45; }
+.hidden { display: none; }
+.note { font-size: 11px; color: #64748b; text-align: center; margin-top: 10px; line-height: 1.4; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Kraken Adaptive Multi-Strategy Bot</h1>
+      <div class="sub">Grid • Dip • Scalp • Floor Memory • Swing • Risk-Off • 434-Pair Intel</div>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <span class="badge" id="botBadge">AUTO-BOT RUNNING</span>
+      <span class="badge" id="connBadge">LIVE KRAKEN</span>
+    </div>
+  </header>
+
+  <div class="tabs">
+    <button class="tab active" onclick="showTab('terminal', this)">Live Bot & Book</button>
+    <button class="tab" onclick="showTab('positions', this)">Grid & Positions</button>
+    <button class="tab" onclick="showTab('winners', this)">434-Pair Winners</button>
+    <button class="tab" onclick="showTab('intel', this)">RL, Floors & Time</button>
+  </div>
+
+  <!-- TAB 1: LIVE TERMINAL, ORDER BOOK, CVD, AUTO-BOT -->
+  <div id="tab-terminal">
+    <div class="card">
+      <h2>
+        <span>Active Pair & Autonomous Engine</span>
+        <div style="display:flex;gap:6px">
+          <button class="btn buy" id="toggleBotBtn" style="flex:0;padding:5px 10px;font-size:11px" onclick="toggleAutoBot()">Pause Bot</button>
+          <button class="btn blue" style="flex:0;padding:5px 10px;font-size:11px" onclick="runBotCycle(true)">Step Cycle</button>
+        </div>
+      </h2>
+      <select id="pairSelect" onchange="switchPair()">
+        <option value="XETHZUSD">XETHZUSD — Ethereum (ETH/USD)</option>
+        <option value="XXBTZUSD">XXBTZUSD — Bitcoin (BTC/USD)</option>
+        <option value="SOLUSD">SOLUSD — Solana (SOL/USD)</option>
+        <option value="VELOUSD">VELOUSD — VELO (#1 Consistent 2-Month Winner)</option>
+        <option value="PROSUSD">PROSUSD — PROS (#2 Consistent 2-Month Winner)</option>
+        <option value="VSNUSD">VSNUSD — VSN (#3 Consistent 2-Month Winner)</option>
+        <option value="INITUSD">INITUSD — INIT (#4 Consistent 2-Month Winner)</option>
+        <option value="JSTUSD">JSTUSD — JST (#6 Consistent 2-Month Winner)</option>
+      </select>
+      <div class="grid3">
+        <div class="stat"><div class="lbl">Live Mid / Microprice</div><div class="val" id="lvMid">$--</div></div>
+        <div class="stat"><div class="lbl">Detected Regime</div><div class="val" id="lvRegime">--</div></div>
+        <div class="stat"><div class="lbl">Active Strategies</div><div class="val" id="lvStrats" style="font-size:12px">grid, dip, scalp</div></div>
+        <div class="stat"><div class="lbl">Order Book Imbalance</div><div class="val" id="lvObi">--</div><div class="gauge"><div id="obiBar" style="width:50%"></div></div></div>
+        <div class="stat"><div class="lbl">Live Floor Score</div><div class="val" id="lvFloor">--</div><div class="gauge"><div id="flBar" style="width:0%"></div></div></div>
+        <div class="stat"><div class="lbl">Exposure / Cap (60%)</div><div class="val" id="lvExp">0.0%</div><div class="gauge"><div id="expBar" style="width:0%"></div></div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span>Live L2 Order Book & Walls (Kraken Depth)</span><span id="lvSpread" style="font-size:11px;color:#94a3b8"></span></h2>
+      <div class="grid2">
+        <div>
+          <div style="font-size:11px;color:#34d399;margin-bottom:4px;font-weight:700">BIDS (Support / Wall ★)</div>
+          <table id="bidsTbl"><tbody></tbody></table>
+        </div>
+        <div>
+          <div style="font-size:11px;color:#f87171;margin-bottom:4px;font-weight:700">ASKS (Resistance / Wall ★)</div>
+          <table id="asksTbl"><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span>Live Bot Decision Log (trades.log)</span><span id="cycleCountLbl" style="font-size:11px;color:#94a3b8">Cycle 0</span></h2>
+      <div class="logbox" id="logBox"></div>
+    </div>
+  </div>
+
+  <!-- TAB 2: GRID LADDER, POSITIONS, EQUITY & MANUAL OVERRIDES -->
+  <div id="tab-positions" class="hidden">
+    <div class="card">
+      <h2><span>Dry-Run Account Equity (Real Fees: 0.16% Maker / 0.26% Taker)</span><button class="btn sell" style="flex:0;padding:4px 8px;font-size:11px" onclick="botReset()">Reset $5,000</button></h2>
+      <div class="grid3">
+        <div class="stat"><div class="lbl">Total Equity</div><div class="val" id="ppEq">$5,000.00</div></div>
+        <div class="stat"><div class="lbl">Available USD</div><div class="val" id="ppUsd">$5,000.00</div></div>
+        <div class="stat"><div class="lbl">Held Asset Units</div><div class="val" id="ppUnits">0.0000</div></div>
+        <div class="stat"><div class="lbl">Realized Net PnL</div><div class="val" id="ppPnl">$0.00</div></div>
+        <div class="stat"><div class="lbl">Closed / Win Rate</div><div class="val" id="ppWr">0 (0%)</div></div>
+        <div class="stat"><div class="lbl">Kraken Fees Paid</div><div class="val" id="ppFees">$0.00</div></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn blue" onclick="rebuildGridNow()">Rebuild 6-Level Grid</button>
+        <button class="btn buy" onclick="manualEntry('dip')">Force Dip Buy</button>
+        <button class="btn buy" onclick="manualEntry('floor')">Force Floor Buy</button>
+        <button class="btn buy" onclick="manualEntry('swing')">Force Swing</button>
+        <button class="btn sell" onclick="riskOffNow()">50% Risk-Off Cut</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2><span>Active 6-Level Grid Orders (1.75% Spacing, Maker 0.16%)</span></h2>
+      <table id="gridTbl">
+        <thead><tr><th>Level</th><th>Side</th><th>Limit Price</th><th>USD / Vol</th><th>Dist</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2><span>Open Dip / Scalp / Floor / Swing Positions</span></h2>
+      <table id="ppPosTbl">
+        <thead><tr><th>Pair</th><th>Strategy</th><th>Entry</th><th>TP / SL</th><th>uPnL</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- TAB 3: 2-MONTH DATA ENGINE WINNERS -->
+  <div id="tab-winners" class="hidden">
+    <div class="card">
+      <h2><span>Consistent 2-Month Winners (Profitable in BOTH Months)</span><span style="font-size:11px;color:#94a3b8">$5,000/asset</span></h2>
+      <table id="cwTbl">
+        <thead><tr><th>Asset</th><th>Last M</th><th>This M</th><th>2M Total Net</th><th>WR</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2><span>This Month Top Performers</span></h2>
+      <table id="tmTbl">
+        <thead><tr><th>Asset</th><th>Net Equity PnL</th><th>Realized</th><th>Trades</th><th>WR</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2><span>Last Month Top Performers</span></h2>
+      <table id="lmTbl">
+        <thead><tr><th>Asset</th><th>Net Equity PnL</th><th>Realized</th><th>Trades</th><th>WR</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- TAB 4: RL LEARNING, FLOOR MEMORY & TIME INTEL -->
+  <div id="tab-intel" class="hidden">
+    <div class="card">
+      <h2><span>Data Engine Auto-Feed Multipliers (Active in Bot)</span></h2>
+      <div class="grid3">
+        <div class="stat"><div class="lbl">UTC Time Gate</div><div class="val" id="itNow">--</div></div>
+        <div class="stat"><div class="lbl">Time Multiplier</div><div class="val" id="itMult">--</div></div>
+        <div class="stat"><div class="lbl">Asset Rank Mult</div><div class="val" id="itAssetMult">--</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2><span>Remembered Floor Levels (floor_memory.json)</span></h2>
+      <table id="memFloorTbl">
+        <thead><tr><th>Pair</th><th>Price Level</th><th>Held / Failed</th><th>Boost Weight</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2><span>Strategy Standings Across 434 Kraken Pairs (95,041 Trades)</span></h2>
+      <table id="stTbl">
+        <thead><tr><th>Strategy</th><th>Last Month PnL</th><th>This Month PnL</th><th>Win Rate</th><th>Bot Weight</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2><span>100% Floor-Holding Champions (Data Engine)</span></h2>
+      <table id="flTbl">
+        <thead><tr><th>Asset</th><th>Floors Bought</th><th>Floors Held</th><th>Hold Rate</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <p class="note">
+    100% Free Forever • Runs the Full Adaptive Bot Engine in Your Browser • Add to Home Screen on Android (Chrome ⋮ → Add to Home screen) or iPhone (Safari Share → Add to Home Screen).
+  </p>
+</div>
+
+<script>
+const REPORT = __REPORT_JSON__;
+const MAKER = 0.0016, TAKER = 0.0026, SLIP = 0.0005;
+const EXPOSURE_CAP = 0.60, GRID_SPACING = 0.0175, GRID_LEVELS = 6;
+let autoBot = true, curMid = 0, curObi = 0, curFscore = 0, curHigh24 = 0, curLow24 = 0;
+
+function defaultState() {
+  return {
+    usd: 5000.0,
+    units: {},
+    realized: 0.0,
+    fees: 0.0,
+    trades: 0,
+    wins: 0,
+    cycle: 0,
+    regime: 'sideways',
+    prevRegime: 'sideways',
+    history: {},
+    gridOrders: {},
+    positions: [],
+    floorMemory: {},
+    stratStats: {grid:[0,0], dip:[0,0], scalp:[0,0], floor:[0,0], swing:[0,0]},
+    logs: []
+  };
+}
+
+function loadState() {
+  try {
+    const s = JSON.parse(localStorage.getItem('kraken_full_bot_v2'));
+    return s ? Object.assign(defaultState(), s) : defaultState();
+  } catch (e) { return defaultState(); }
+}
+function saveState(s) { localStorage.setItem('kraken_full_bot_v2', JSON.stringify(s)); }
+
+function logMsg(s, msg) {
+  const ts = new Date().toISOString().slice(11, 19);
+  s.logs.unshift(`[${ts}] ${msg}`);
+  if (s.logs.length > 60) s.logs.pop();
+}
+
+function showTab(name, btn) {
+  ['terminal','positions','winners','intel'].forEach(t => {
+    document.getElementById('tab-' + t).classList.add('hidden');
+  });
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.remove('hidden');
+  btn.classList.add('active');
+}
+
+function toggleAutoBot() {
+  autoBot = !autoBot;
+  const b = document.getElementById('botBadge');
+  const btn = document.getElementById('toggleBotBtn');
+  b.textContent = autoBot ? 'AUTO-BOT RUNNING' : 'AUTO-BOT PAUSED';
+  b.className = 'badge' + (autoBot ? '' : ' warn');
+  btn.textContent = autoBot ? 'Pause Bot' : 'Resume Bot';
+}
+
+function switchPair() { runBotCycle(true); }
+
+function getDeMultipliers(pair) {
+  const now = new Date();
+  const hrPnl = (REPORT.pnl_by_hour_utc || {})[String(now.getUTCHours())];
+  const dayPnl = (REPORT.pnl_by_day_of_month || {})[String(now.getUTCDate())];
+  let tMult = 1.0;
+  if (hrPnl !== undefined) tMult *= (hrPnl < 0 ? 0.80 : 1.08);
+  if (dayPnl !== undefined) tMult *= (dayPnl < 0 ? 0.85 : 1.05);
+  const cwPairs = new Set((REPORT.consistent_winners || []).map(w => w.pair));
+  const aMult = cwPairs.has(pair) ? 1.20 : 1.0;
+  return {timeMult: tMult, assetMult: aMult, comb: tMult * aMult};
+}
+
+function floorBoostFor(s, pair, price) {
+  const mem = s.floorMemory[pair] || [];
+  let best = 0;
+  mem.forEach(m => {
+    const prox = Math.max(0, 1 - Math.abs(price - m.level) / (m.level * 0.02));
+    const str = (m.hits + 1) / (m.hits + m.fails + 2);
+    best = Math.max(best, prox * str);
+  });
+  return best;
+}
+
+function recordFloorOutcome(s, pair, entryPrice, won) {
+  if (!s.floorMemory[pair]) s.floorMemory[pair] = [];
+  const mem = s.floorMemory[pair];
+  let found = mem.find(m => Math.abs(m.level - entryPrice) / entryPrice < 0.015);
+  if (!found) {
+    found = {level: entryPrice, hits: 0, fails: 0};
+    mem.push(found);
+  }
+  if (won) found.hits++; else found.fails++;
+}
+
+function buildGridForPair(s, pair, price, mult) {
+  const eq = totalEquity(s, pair, price);
+  const alloc = Math.min(s.usd * 0.60, eq * 0.50 * mult);
+  const per = alloc / GRID_LEVELS;
+  const half = GRID_LEVELS / 2;
+  const orders = [];
+  for (let i = 1; i <= half; i++) {
+    const bp = price * (1 - GRID_SPACING * i);
+    orders.push({lvl: 'B' + i, side: 'buy', price: bp, usd: per, vol: per / bp});
+  }
+  for (let i = 1; i <= half; i++) {
+    const sp = price * (1 + GRID_SPACING * i);
+    orders.push({lvl: 'S' + i, side: 'sell', price: sp, usd: per, vol: per / sp});
+  }
+  s.gridOrders[pair] = orders;
+  logMsg(s, `[Grid] Placed ${orders.length}-level ladder on ${pair} around $${price.toFixed(price<1?5:2)}`);
+}
+
+function totalEquity(s, curPair, price) {
+  let eq = s.usd;
+  Object.entries(s.units).forEach(([p, u]) => {
+    const px = (p === curPair && price) ? price : ((s.history[p] || []).slice(-1)[0] || 0);
+    eq += u * px;
+  });
+  return eq;
+}
+
+async function runBotCycle(forceStep = false) {
+  const pair = document.getElementById('pairSelect').value;
+  try {
+    const [tkRes, dpRes] = await Promise.all([
+      fetch('https://api.kraken.com/0/public/Ticker?pair=' + pair).then(r => r.json()),
+      fetch('https://api.kraken.com/0/public/Depth?pair=' + pair + '&count=12').then(r => r.json())
+    ]);
+    const tk = Object.values(tkRes.result)[0];
+    const ask = parseFloat(tk.a[0]), bid = parseFloat(tk.b[0]);
+    curHigh24 = parseFloat(tk.h[1]); curLow24 = parseFloat(tk.l[1]);
+    const open24 = parseFloat(tk.o);
+    curMid = (ask + bid) / 2;
+    const dec = curMid < 1 ? 5 : (curMid < 100 ? 3 : 2);
+
+    // Order book walls + OBI + microprice
+    const book = Object.values(dpRes.result)[0];
+    const bids = book.bids || [], asks = book.asks || [];
+    let bidVol = 0, askVol = 0, maxBid = 0, maxAsk = 0;
+    bids.slice(0, 8).forEach(b => { const u = parseFloat(b[0]) * parseFloat(b[1]); bidVol += u; if (u > maxBid) maxBid = u; });
+    asks.slice(0, 8).forEach(a => { const u = parseFloat(a[0]) * parseFloat(a[1]); askVol += u; if (u > maxAsk) maxAsk = u; });
+    curObi = (bidVol + askVol) > 0 ? (bidVol - askVol) / (bidVol + askVol) : 0;
+    const topBidP = bids[0] ? parseFloat(bids[0][0]) : bid, topBidV = bids[0] ? parseFloat(bids[0][1]) : 1;
+    const topAskP = asks[0] ? parseFloat(asks[0][0]) : ask, topAskV = asks[0] ? parseFloat(asks[0][1]) : 1;
+    const micro = (topBidP * topAskV + topAskP * topBidV) / (topBidV + topAskV);
+
+    const bBody = document.querySelector('#bidsTbl tbody');
+    const aBody = document.querySelector('#asksTbl tbody');
+    bBody.innerHTML = ''; aBody.innerHTML = '';
+    bids.slice(0, 6).forEach(b => {
+      const p = parseFloat(b[0]), u = p * parseFloat(b[1]);
+      const wall = u >= maxBid * 0.85 ? ' ★' : '';
+      bBody.innerHTML += `<tr><td class="pos">$${p.toFixed(dec)}${wall}</td><td>$${u.toFixed(0)}</td></tr>`;
+    });
+    asks.slice(0, 6).forEach(a => {
+      const p = parseFloat(a[0]), u = p * parseFloat(a[1]);
+      const wall = u >= maxAsk * 0.85 ? ' ★' : '';
+      aBody.innerHTML += `<tr><td class="neg">$${p.toFixed(dec)}${wall}</td><td>$${u.toFixed(0)}</td></tr>`;
+    });
+
+    const s = loadState();
+    if (!s.history[pair]) s.history[pair] = [];
+    s.history[pair].push(curMid);
+    if (s.history[pair].length > 120) s.history[pair].shift();
+    if (!s.units[pair]) s.units[pair] = 0;
+
+    // Regime detection (24h change + rolling MA)
+    const chg24 = open24 > 0 ? (curMid - open24) / open24 * 100 : 0;
+    s.prevRegime = s.regime;
+    if (chg24 >= 2.5) s.regime = 'uptrend';
+    else if (chg24 <= -3.5) s.regime = 'downtrend';
+    else s.regime = 'sideways';
+
+    // Floor score = drawdown from 24h high + OBI support + remembered floor boost
+    const dd24 = curHigh24 > 0 ? (curHigh24 - curMid) / curHigh24 : 0;
+    const memBoost = floorBoostFor(s, pair, curMid);
+    curFscore = Math.min(1, Math.max(0, 0.50 * Math.min(1, dd24 / 0.08) + 0.30 * Math.max(0, curObi) + 0.20 * memBoost));
+
+    const eq = totalEquity(s, pair, curMid);
+    const heldVal = (s.units[pair] || 0) * curMid;
+    const exp = eq > 0 ? heldVal / eq : 0;
+    const de = getDeMultipliers(pair);
+
+    if (autoBot || forceStep) {
+      s.cycle += 1;
+
+      // 1. Risk-off on confirmed downtrend flip: cut 50% held inventory
+      if (s.regime === 'downtrend' && s.prevRegime !== 'downtrend' && s.units[pair] > 0) {
+        const cut = s.units[pair] * 0.50;
+        const exitP = curMid * (1 - SLIP);
+        const fee = cut * exitP * TAKER;
+        s.usd += cut * exitP - fee;
+        s.units[pair] -= cut;
+        s.fees += fee;
+        s.trades += 1;
+        s.gridOrders[pair] = [];
+        logMsg(s, `[RiskOff] Downtrend flip on ${pair} — sold 50% inventory (${cut.toFixed(4)}) @ $${exitP.toFixed(dec)}`);
+      }
+
+      // 2. Grid management
+      if (s.regime !== 'downtrend') {
+        if (!s.gridOrders[pair] || s.gridOrders[pair].length === 0) {
+          buildGridForPair(s, pair, curMid, de.comb);
+        }
+        const remGrid = [];
+        (s.gridOrders[pair] || []).forEach(g => {
+          if (g.side === 'buy' && curMid <= g.price && s.usd >= g.usd && exp < EXPOSURE_CAP) {
+            const fee = g.usd * MAKER;
+            const vol = (g.usd - fee) / g.price;
+            s.usd -= g.usd;
+            s.units[pair] += vol;
+            s.fees += fee;
+            remGrid.push({lvl: g.lvl + '→TP', side: 'sell', price: g.price * (1 + GRID_SPACING), usd: g.usd, vol});
+            logMsg(s, `[Grid] Buy filled ${vol.toFixed(4)} ${pair} @ $${g.price.toFixed(dec)}`);
+          } else if (g.side === 'sell' && curMid >= g.price && s.units[pair] >= g.vol) {
+            const fee = g.vol * g.price * MAKER;
+            const net = g.vol * g.price * GRID_SPACING - fee;
+            s.usd += g.vol * g.price - fee;
+            s.units[pair] -= g.vol;
+            s.fees += fee;
+            s.realized += net;
+            s.trades += 1; s.wins += 1;
+            s.stratStats.grid[0]++; s.stratStats.grid[1]++;
+            remGrid.push({lvl: g.lvl, side: 'buy', price: g.price * (1 - GRID_SPACING), usd: g.usd, vol: g.vol});
+            logMsg(s, `[Grid] TP Sell filled ${pair} @ $${g.price.toFixed(dec)} (net +$${net.toFixed(2)})`);
+          } else {
+            remGrid.push(g);
+          }
+        });
+        s.gridOrders[pair] = remGrid;
+      }
+
+      // 3. Check exits on Dip / Scalp / Floor / Swing positions
+      const keptPos = [];
+      s.positions.forEach(p => {
+        const px = p.pair === pair ? curMid : p.entry;
+        if (p.pair === pair && px >= p.tp) {
+          const fee = p.vol * p.tp * MAKER;
+          const pnl = (p.tp - p.entry) * p.vol - fee - p.entryFee;
+          s.usd += p.vol * p.tp - fee;
+          s.units[pair] = Math.max(0, (s.units[pair] || 0) - p.vol);
+          s.fees += fee; s.realized += pnl; s.trades++; if (pnl > 0) s.wins++;
+          if (p.strat === 'floor') recordFloorOutcome(s, pair, p.entry, pnl > 0);
+          logMsg(s, `[${p.strat.toUpperCase()}] TP hit on ${pair} @ $${p.tp.toFixed(dec)} (pnl +$${pnl.toFixed(2)})`);
+        } else if (p.pair === pair && px <= p.sl) {
+          const exitP = px * (1 - SLIP);
+          const fee = p.vol * exitP * TAKER;
+          const pnl = (exitP - p.entry) * p.vol - fee - p.entryFee;
+          s.usd += p.vol * exitP - fee;
+          s.units[pair] = Math.max(0, (s.units[pair] || 0) - p.vol);
+          s.fees += fee; s.realized += pnl; s.trades++;
+          if (p.strat === 'floor') recordFloorOutcome(s, pair, p.entry, false);
+          logMsg(s, `[${p.strat.toUpperCase()}] SL exit on ${pair} @ $${exitP.toFixed(dec)} (pnl $${pnl.toFixed(2)})`);
+        } else {
+          keptPos.push(p);
+        }
+      });
+      s.positions = keptPos;
+
+      // 4. Autonomous entries (when below 60% exposure cap & order flow not heavily bearish)
+      const hasPairPos = s.positions.some(p => p.pair === pair);
+      if (!hasPairPos && exp < EXPOSURE_CAP && curObi > -0.40 && s.usd > 50) {
+        if (curFscore >= 0.65) {
+          openPosition(s, pair, 'floor', curMid, 0.25 * de.comb, 0.04, 0.06, dec);
+        } else if (s.regime === 'uptrend' && dd24 >= 0.04) {
+          openPosition(s, pair, 'swing', curMid, 0.20 * de.comb, 0.12, 0.06, dec);
+        } else if (dd24 >= 0.03) {
+          openPosition(s, pair, 'dip', curMid, 0.15 * de.comb, 0.0175, 0.10, dec);
+        }
+      }
+    }
+
+    saveState(s);
+    renderUI(s, pair, curMid, micro, ask - bid, dec, exp, de);
+    document.getElementById('connBadge').textContent = 'LIVE KRAKEN';
+  } catch (e) {
+    document.getElementById('connBadge').textContent = 'RECONNECTING';
+  }
+}
+
+function openPosition(s, pair, strat, price, allocFrac, tpPct, slPct, dec) {
+  const spend = Math.min(s.usd, totalEquity(s, pair, price) * allocFrac);
+  if (spend < 15) return;
+  const isLimit = strat === 'scalp';
+  const fee = spend * (isLimit ? MAKER : TAKER);
+  const entry = isLimit ? price : price * (1 + SLIP);
+  const vol = (spend - fee) / entry;
+  s.usd -= spend;
+  s.units[pair] = (s.units[pair] || 0) + vol;
+  s.fees += fee;
+  s.positions.push({pair, strat, entry, entryFee: fee, vol, tp: entry * (1 + tpPct), sl: entry * (1 - slPct)});
+  logMsg(s, `[${strat.toUpperCase()}] Opened ${vol.toFixed(4)} ${pair} @ $${entry.toFixed(dec)} (TP $${(entry*(1+tpPct)).toFixed(dec)})`);
+}
+
+function manualEntry(strat) {
+  if (!curMid) return;
+  const pair = document.getElementById('pairSelect').value;
+  const dec = curMid < 1 ? 5 : 2;
+  const s = loadState();
+  const cfg = {dip:[0.15,0.0175,0.10], floor:[0.25,0.04,0.06], swing:[0.20,0.12,0.06]}[strat];
+  openPosition(s, pair, strat, curMid, cfg[0], cfg[1], cfg[2], dec);
+  saveState(s);
+  runBotCycle(false);
+}
+
+function rebuildGridNow() {
+  if (!curMid) return;
+  const pair = document.getElementById('pairSelect').value;
+  const s = loadState();
+  buildGridForPair(s, pair, curMid, getDeMultipliers(pair).comb);
+  saveState(s);
+  runBotCycle(false);
+}
+
+function riskOffNow() {
+  if (!curMid) return;
+  const pair = document.getElementById('pairSelect').value;
+  const s = loadState();
+  const held = s.units[pair] || 0;
+  if (held <= 0) return;
+  const cut = held * 0.50;
+  const exitP = curMid * (1 - SLIP);
+  const fee = cut * exitP * TAKER;
+  s.usd += cut * exitP - fee;
+  s.units[pair] -= cut;
+  s.fees += fee;
+  logMsg(s, `[RiskOff] Manual 50% inventory cut on ${pair}: sold ${cut.toFixed(4)} @ $${exitP.toFixed(2)}`);
+  saveState(s);
+  runBotCycle(false);
+}
+
+function botReset() {
+  localStorage.removeItem('kraken_full_bot_v2');
+  runBotCycle(true);
+}
+
+function renderUI(s, pair, price, micro, spread, dec, exp, de) {
+  document.getElementById('lvMid').textContent = `$${price.toFixed(dec)} (μ $${micro.toFixed(dec)})`;
+  const rEl = document.getElementById('lvRegime');
+  rEl.textContent = s.regime.toUpperCase();
+  rEl.className = 'val ' + (s.regime === 'uptrend' ? 'pos' : (s.regime === 'downtrend' ? 'neg' : 'warn'));
+  const stMap = {uptrend: 'grid, dip, scalp, swing', sideways: 'grid, floor', downtrend: 'dip, scalp, floor (risk-off)'};
+  document.getElementById('lvStrats').textContent = stMap[s.regime];
+
+  const obiEl = document.getElementById('lvObi');
+  obiEl.textContent = (curObi >= 0 ? '+' : '') + curObi.toFixed(3);
+  obiEl.className = 'val ' + (curObi > 0.1 ? 'pos' : (curObi < -0.1 ? 'neg' : ''));
+  document.getElementById('obiBar').style.width = ((curObi + 1) * 50).toFixed(0) + '%';
+
+  const flEl = document.getElementById('lvFloor');
+  flEl.textContent = curFscore.toFixed(2) + (curFscore >= 0.65 ? ' (BUY FLOOR)' : '');
+  flEl.className = 'val ' + (curFscore >= 0.65 ? 'pos' : 'warn');
+  document.getElementById('flBar').style.width = (curFscore * 100).toFixed(0) + '%';
+
+  const expEl = document.getElementById('lvExp');
+  expEl.textContent = (exp * 100).toFixed(1) + '%';
+  expEl.className = 'val ' + (exp >= EXPOSURE_CAP ? 'neg' : 'pos');
+  document.getElementById('expBar').style.width = Math.min(100, exp * 100).toFixed(0) + '%';
+  document.getElementById('lvSpread').textContent = `Spread: $${spread.toFixed(dec)}`;
+  document.getElementById('cycleCountLbl').textContent = `Cycle ${s.cycle}`;
+  document.getElementById('logBox').innerHTML = s.logs.map(l => `<div>${l}</div>`).join('') || '<div>Waiting for first cycle...</div>';
+
+  // Equity & Positions tab
+  const eq = totalEquity(s, pair, price);
+  document.getElementById('ppEq').textContent = '$' + eq.toFixed(2);
+  document.getElementById('ppUsd').textContent = '$' + s.usd.toFixed(2);
+  document.getElementById('ppUnits').textContent = (s.units[pair] || 0).toFixed(4) + ' ' + pair.replace('ZUSD','').replace('USD','');
+  const pEl = document.getElementById('ppPnl');
+  pEl.textContent = (s.realized >= 0 ? '+' : '') + '$' + s.realized.toFixed(2);
+  pEl.className = 'val ' + (s.realized >= 0 ? 'pos' : 'neg');
+  const wr = s.trades > 0 ? Math.round(s.wins / s.trades * 100) : 0;
+  document.getElementById('ppWr').textContent = `${s.trades} (${wr}% WR)`;
+  document.getElementById('ppFees').textContent = '$' + s.fees.toFixed(2);
+
+  const gBody = document.querySelector('#gridTbl tbody');
+  gBody.innerHTML = '';
+  (s.gridOrders[pair] || []).forEach(g => {
+    const dist = ((g.price - price) / price * 100).toFixed(2) + '%';
+    gBody.innerHTML += `<tr><td><b>${g.lvl}</b></td><td class="${g.side==='buy'?'pos':'neg'}">${g.side.toUpperCase()}</td><td>$${g.price.toFixed(dec)}</td><td>$${g.usd.toFixed(0)} (${g.vol.toFixed(3)})</td><td>${dist}</td></tr>`;
+  });
+
+  const pBody = document.querySelector('#ppPosTbl tbody');
+  pBody.innerHTML = '';
+  s.positions.forEach(p => {
+    const px = p.pair === pair ? price : p.entry;
+    const upnl = (px - p.entry) * p.vol;
+    const d = p.entry < 1 ? 5 : 2;
+    pBody.innerHTML += `<tr><td><b>${p.pair}</b></td><td>${p.strat.toUpperCase()}</td><td>$${p.entry.toFixed(d)}</td><td>$${p.tp.toFixed(d)} / $${p.sl.toFixed(d)}</td><td class="${upnl>=0?'pos':'neg'}">${upnl>=0?'+':''}$${upnl.toFixed(2)}</td></tr>`;
+  });
+
+  // Floor memory table
+  const fmBody = document.querySelector('#memFloorTbl tbody');
+  fmBody.innerHTML = '';
+  Object.entries(s.floorMemory).forEach(([pr, list]) => {
+    list.forEach(m => {
+      const w = ((m.hits + 1) / (m.hits + m.fails + 2) * 100).toFixed(0) + '%';
+      fmBody.innerHTML += `<tr><td><b>${pr}</b></td><td>$${m.level.toFixed(m.level<1?5:2)}</td><td>${m.hits} held / ${m.fails} failed</td><td class="pos">${w}</td></tr>`;
+    });
+  });
+  if (!fmBody.innerHTML) fmBody.innerHTML = '<tr><td colspan="4" style="color:#64748b">Floor levels are remembered automatically as floor trades close.</td></tr>';
+
+  document.getElementById('itAssetMult').textContent = de.assetMult.toFixed(2) + 'x';
+}
+
+function renderReportTables() {
+  const cwBody = document.querySelector('#cwTbl tbody');
+  REPORT.consistent_winners.forEach(r => {
+    cwBody.innerHTML += `<tr><td><b>${r.asset}</b></td><td class="pos">+$${r.last_month_net.toFixed(0)}</td><td class="pos">+$${r.this_month_net.toFixed(0)}</td><td class="pos"><b>+$${r.total_net_pnl.toFixed(0)}</b></td><td>${(r.win_rate*100).toFixed(0)}%</td></tr>`;
+  });
+  const tmBody = document.querySelector('#tmTbl tbody');
+  REPORT.this_month_top.slice(0, 10).forEach(r => {
+    tmBody.innerHTML += `<tr><td><b>${r.asset}</b></td><td class="pos">+$${r.net_equity_pnl.toFixed(0)}</td><td>+$${r.realized_pnl.toFixed(0)}</td><td>${r.trades}</td><td>${(r.win_rate*100).toFixed(0)}%</td></tr>`;
+  });
+  const lmBody = document.querySelector('#lmTbl tbody');
+  REPORT.last_month_top.slice(0, 10).forEach(r => {
+    lmBody.innerHTML += `<tr><td><b>${r.asset}</b></td><td class="pos">+$${r.net_equity_pnl.toFixed(0)}</td><td>+$${r.realized_pnl.toFixed(0)}</td><td>${r.trades}</td><td>${(r.win_rate*100).toFixed(0)}%</td></tr>`;
+  });
+  const stBody = document.querySelector('#stTbl tbody');
+  const sLast = REPORT.pnl_by_strategy.last_month || {};
+  const sThis = REPORT.pnl_by_strategy.this_month || {};
+  ['grid','floor','dip','scalp','swing'].forEach(k => {
+    const l = sLast[k] || {pnl:0, wr:0}, t = sThis[k] || {pnl:0, wr:0};
+    const wt = t.pnl >= 0 ? '1.15x Boost' : '0.65x Throttle';
+    stBody.innerHTML += `<tr><td><b>${k.toUpperCase()}</b></td><td class="${l.pnl>=0?'pos':'neg'}">$${l.pnl.toFixed(0)}</td><td class="${t.pnl>=0?'pos':'neg'}">$${t.pnl.toFixed(0)}</td><td>${(t.wr*100).toFixed(0)}%</td><td class="${t.pnl>=0?'pos':'warn'}">${wt}</td></tr>`;
+  });
+  const flBody = document.querySelector('#flTbl tbody');
+  Object.entries(REPORT.floor_accuracy).forEach(([a, v]) => {
+    flBody.innerHTML += `<tr><td><b>${a}</b></td><td>${v.floors}</td><td>${v.held}</td><td class="pos">${(v.rate*100).toFixed(0)}%</td></tr>`;
+  });
+
+  const now = new Date();
+  const hr = now.getUTCHours(), day = now.getUTCDate();
+  const de = getDeMultipliers('XETHZUSD');
+  document.getElementById('itNow').textContent = `${hr}:00 UTC (Day ${day})`;
+  const mEl = document.getElementById('itMult');
+  mEl.textContent = de.timeMult.toFixed(2) + 'x';
+  mEl.className = 'val ' + (de.timeMult >= 1 ? 'pos' : 'warn');
+}
+
+renderReportTables();
+runBotCycle(true);
+setInterval(() => runBotCycle(false), 15000);
+</script>
+</body>
+</html>
+"""
+
+html_out = HTML.replace("__REPORT_JSON__", json.dumps(embedded))
+out_path = os.path.join(BOT_DIR, "index.html")
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write(html_out)
+print("Built full-featured index.html:", len(html_out), "bytes")
