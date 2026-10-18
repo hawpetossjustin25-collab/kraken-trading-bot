@@ -582,5 +582,9 @@ class DataEngine:
             time.sleep(CYCLE_SEC)
 
 
-if __name__ == "__main__":
+def main():
     DataEngine().run()
+
+
+if __name__ == "__main__":
+    main()
