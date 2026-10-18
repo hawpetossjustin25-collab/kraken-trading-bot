@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kraken-trading-bot"
+version = "2.0.0"
+description = "Adaptive Multi-Strategy Kraken Trading Bot with Live L2 Order Flow, Floor Memory, Walk-Forward Backtester, and 628-Pair Data Engine"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "hawpetossjustin25-collab"}]
+dependencies = [
+    "requests>=2.28.0",
+    "websocket-client>=1.6.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+kraken-bot = "bot:main"
+kraken-dashboard = "dashboard:main"
+kraken-backtester = "backtester:main"
+kraken-data-engine = "data_engine:main"
+kraken-trainer = "trainer:main"
+
+[tool.setuptools]
+py-modules = [
+    "bot",
+    "order_flow",
+    "improvement_engine",
+    "dashboard",
+    "backtester",
+    "data_engine",
+    "trainer",
+    "run_bot",
+    "test_system",
+    "test_kraken_navigation",
+]
