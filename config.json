@@ -1,7 +1,13 @@
 {
+    "dry_run": true,
+    "order_flow_enabled": true,
+    "dry_run_equity": 100.0,
     "api_key": "YOUR_KRAKEN_API_KEY",
     "api_secret": "YOUR_KRAKEN_API_SECRET",
     "pair": "XETHZUSD",
+    "pairs": ["XETHZUSD"],
+    "maker_fee_pct": 0.16,
+    "taker_fee_pct": 0.26,
     "asset": "ETH",
     "currency": "ZUSD",
 
@@ -50,7 +56,9 @@
     "daily_max_loss_usd": 30.0,
     "stop_loss_equity": 60.0,
     "take_profit_equity": 500.0,
-    "check_interval_sec": 60,
+    "check_interval_sec": 20,
+    "trade_min_interval_sec": 2,
+    "trades_per_hour": 60,
     "log_file": "trades.log",
 
     "rl_enabled": true,
