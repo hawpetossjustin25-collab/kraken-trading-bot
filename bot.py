@@ -34,6 +34,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 import requests
+import threading
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -55,7 +56,10 @@ def load_config() -> dict:
         cfg["api_key"] = os.environ["KRAKEN_API_KEY"]
     if os.environ.get("KRAKEN_API_SECRET"):
         cfg["api_secret"] = os.environ["KRAKEN_API_SECRET"]
-    if cfg.get("api_key", "").startswith("YOUR_"):
+    if cfg.get("dry_run"):
+        cfg.setdefault("api_key", "DRYRUN")
+        cfg.setdefault("api_secret", "DRYRUN")
+    elif cfg.get("api_key", "").startswith("YOUR_"):
         print("ERROR: Set KRAKEN_API_KEY/KRAKEN_API_SECRET env vars or replace placeholders in config.json.")
         sys.exit(1)
     return cfg
@@ -70,7 +74,12 @@ def setup_logging(log_file: str) -> logging.Logger:
     logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-    fh = logging.FileHandler(os.path.join(BASE_DIR, log_file))
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+    fh = logging.FileHandler(os.path.join(BASE_DIR, log_file), encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
@@ -104,8 +113,8 @@ class TradeRateLimiter:
 
     def __init__(self, config: dict, logger: logging.Logger):
         self.log = logger
-        self.min_interval_sec = 5  # 1 trade per 5 seconds
-        self.max_per_hour = 50
+        self.min_interval_sec = config.get("trade_min_interval_sec", 2)
+        self.max_per_hour = config.get("trades_per_hour", 60)
         self.daily_max_loss = config.get("daily_max_loss_usd", 30.0)
         self._last_trade_time: float = 0.0
         self._hourly_trades: deque = deque()  # timestamps of trades within last hour
@@ -177,6 +186,54 @@ class KrakenAPI:
         self.log = logger
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "KrakenMultiBot/2.0"})
+        self._pair_specs: dict[str, dict] = {}
+
+    def get_pair_spec(self, pair: str) -> dict:
+        """Fetch and cache Kraken AssetPairs precision and ordermin metadata."""
+        if pair in self._pair_specs:
+            return self._pair_specs[pair]
+        spec = {"pair_decimals": 2, "lot_decimals": 6, "ordermin": 0.0, "base": "ETH"}
+        try:
+            res = self._public("AssetPairs", {"pair": pair})
+            info = next(iter(res.values()))
+            spec = {
+                "pair_decimals": int(info.get("pair_decimals", 2)),
+                "lot_decimals": int(info.get("lot_decimals", 6)),
+                "ordermin": float(info.get("ordermin", 0.0) or 0.0),
+                "base": str(info.get("base", "ETH")),
+            }
+        except Exception as exc:
+            self.log.debug("Pair spec fallback for %s: %s", pair, exc)
+        self._pair_specs[pair] = spec
+        return spec
+
+    def normalize_order(self, pair: str, volume: str, price: str = "0") -> tuple[str, str, bool]:
+        """Format volume and price to Kraken's exact lot_decimals and pair_decimals."""
+        spec = self.get_pair_spec(pair)
+        vol_f = float(volume)
+        if spec["ordermin"] > 0 and vol_f < spec["ordermin"]:
+            self.log.warning("Order volume %.8f below Kraken ordermin %.8f for %s",
+                             vol_f, spec["ordermin"], pair)
+            return "", "", False
+        vol_s = f"{vol_f:.{spec['lot_decimals']}f}"
+        price_f = float(price) if price else 0.0
+        price_s = f"{price_f:.{spec['pair_decimals']}f}" if price_f > 0 else "0"
+        return vol_s, price_s, True
+
+    def asset_balance(self, pair: str) -> float:
+        """Return held base-asset balance for pair across Kraken ('XETH'/'ETH') & dry-run."""
+        bal = self.balance()
+        if not bal:
+            return 0.0
+        spec = self.get_pair_spec(pair)
+        base = spec.get("base", "ETH")
+        stripped = base[1:] if base.startswith(("X", "Z")) and len(base) > 3 else base
+        p_code = pair.replace("ZUSD", "").replace("USD", "")
+        p_strip = p_code[1:] if p_code.startswith(("X", "Z")) and len(p_code) > 3 else p_code
+        for k in (base, stripped, f"X{stripped}", p_code, p_strip, "ETH"):
+            if k in bal:
+                return float(bal[k])
+        return 0.0
 
     # -- Authentication helpers --
 
@@ -237,8 +294,8 @@ class KrakenAPI:
                         data["nonce"] = self._nonce()
                         headers = self._sign(urlpath, data)
                         continue
-                    if any("Insufficient" in e for e in errs):
-                        self.log.error("Insufficient funds: %s", errs)
+                    if any("Insufficient" in e or e.startswith("EOrder:") for e in errs):
+                        self.log.error("Kraken order rejected: %s", errs)
                         return {}
                     raise RuntimeError(f"Kraken API error: {errs}")
                 return body["result"]
@@ -266,45 +323,40 @@ class KrakenAPI:
         return self._private("OpenOrders")
 
     def add_order(self, pair: str, side: str, volume: str, price: str,
-                  ordertype: str = "limit", oflags: str = "post") -> dict:
+                  ordertype: str = "limit", oflags: str = "post",
+                  validate: bool = False) -> dict:
         """Place an order. Returns order result dict or {} on failure."""
         global _trade_rate_limiter
         if _trade_rate_limiter and not _trade_rate_limiter.can_trade():
             self.log.warning("Order blocked by rate limiter.")
             return {}
-        self.log.info("Placing %s %s order: %s %s @ $%s", ordertype, side, volume, pair, price)
+        vol_s, price_s, ok = self.normalize_order(pair, volume, price)
+        if not ok:
+            return {}
+        self.log.info("Placing %s %s order: %s %s @ $%s", ordertype, side, vol_s, pair, price_s)
         data = {
             "pair": pair,
             "type": side,
             "ordertype": ordertype,
-            "volume": volume,
+            "volume": vol_s,
         }
         if ordertype == "limit":
-            data["price"] = price
+            data["price"] = price_s
             if oflags:
                 data["oflags"] = oflags
+        if validate:
+            data["validate"] = "true"
         # For market orders, no price needed
         result = self._private("AddOrder", data)
         if result and _trade_rate_limiter:
             _trade_rate_limiter.record_trade()
         return result
 
-    def add_market_order(self, pair: str, side: str, volume: str) -> dict:
+    def add_market_order(self, pair: str, side: str, volume: str,
+                         validate: bool = False) -> dict:
         """Place a market order (no price)."""
-        global _trade_rate_limiter
-        if _trade_rate_limiter and not _trade_rate_limiter.can_trade():
-            self.log.warning("Market order blocked by rate limiter.")
-            return {}
-        self.log.info("Placing market %s order: %s %s", side, volume, pair)
-        result = self._private("AddOrder", {
-            "pair": pair,
-            "type": side,
-            "ordertype": "market",
-            "volume": volume,
-        })
-        if result and _trade_rate_limiter:
-            _trade_rate_limiter.record_trade()
-        return result
+        return self.add_order(pair, side, volume, "0", ordertype="market",
+                              oflags="", validate=validate)
 
     def cancel_order(self, txid: str) -> dict:
         return self._private("CancelOrder", {"txid": txid})
@@ -312,10 +364,317 @@ class KrakenAPI:
     def cancel_all(self) -> dict:
         return self._private("CancelAll")
 
+    # -- Reconciliation & execution channel --
+
+    def closed_orders(self) -> dict:
+        """Recently closed orders — used to reconcile actual fill prices."""
+        return self._private("ClosedOrders", {"closetime": "close"})
+
+    def query_orders(self, txids: list[str]) -> dict:
+        """Query specific orders for real fill price/volume."""
+        return self._private("QueryOrders", {"txid": ",".join(txids), "trades": "true"})
+
+    def get_ws_token(self) -> str:
+        """Token for the authenticated WebSocket (ownTrades/openOrders feeds)."""
+        result = self._private("GetWebSocketsToken", {})
+        return result.get("token", "")
+
+
+class DryRunAPI(KrakenAPI):
+    """
+    Paper-trading Kraken client. Public endpoints (ticker, OHLC) hit the real
+    API — no keys needed. Private endpoints are simulated locally:
+    fake balances, fake order IDs, and fills simulated against live prices.
+    """
+
+    def __init__(self, logger: logging.Logger, starting_equity: float = 100.0,
+                 pair: str = "XETHZUSD", maker_fee_pct: float = 0.16,
+                 taker_fee_pct: float = 0.26):
+        # Skip real session headers that need keys — but keep public client working
+        super().__init__("DRYRUN", "DRYRUN", logger)
+        self._pair = pair
+        self._usd = starting_equity
+        self._eth = 0.0
+        self._orders: dict[str, dict] = {}   # txid -> order
+        self._closed: list[dict] = []        # filled orders (reconciliation)
+        self._txid_seq = 0
+        self.maker_fee = maker_fee_pct / 100.0
+        self.taker_fee = taker_fee_pct / 100.0
+        self.fees_paid = 0.0
+
+    def _next_txid(self) -> str:
+        self._txid_seq += 1
+        return f"DRY-{self._txid_seq:06d}"
+
+    def _mid(self) -> float:
+        try:
+            tick = self.ticker(self._pair)
+            info = next(iter(tick.values()))
+            return (float(info["a"][0]) + float(info["b"][0])) / 2.0
+        except Exception:
+            return 2500.0
+
+    def _simulate_fills(self):
+        """Fill limit orders when the live mid-price crosses them.
+        Charges maker fee (limit orders) — honest PnL accounting."""
+        mid = self._mid()
+        for txid in list(self._orders):
+            o = self._orders[txid]
+            if o["type"] == "buy" and mid <= o["price"]:
+                cost = o["volume"] * o["price"]
+                fee = cost * self.maker_fee
+                self._usd -= cost + fee
+                self._eth += o["volume"]
+                self.fees_paid += fee
+                o["status"] = "closed"; o["fee"] = fee; o["price_filled"] = o["price"]
+                self._closed.append(o)
+                del self._orders[txid]
+                self.log.info("[DRY] Filled BUY %.6f ETH @ $%.2f (fee $%.3f)",
+                              o["volume"], o["price"], fee)
+            elif o["type"] == "sell" and mid >= o["price"]:
+                proceeds = o["volume"] * o["price"]
+                fee = proceeds * self.maker_fee
+                self._usd += proceeds - fee
+                self._eth -= o["volume"]
+                self.fees_paid += fee
+                o["status"] = "closed"; o["fee"] = fee; o["price_filled"] = o["price"]
+                self._closed.append(o)
+                del self._orders[txid]
+                self.log.info("[DRY] Filled SELL %.6f ETH @ $%.2f (fee $%.3f)",
+                              o["volume"], o["price"], fee)
+
+    def balance(self) -> dict:
+        return {"ZUSD": f"{self._usd:.2f}", "XETH": f"{self._eth:.6f}"}
+
+    def trade_balance(self, asset: str = "ZUSD") -> dict:
+        self._simulate_fills()
+        equity = self._usd + self._eth * self._mid()
+        return {"eb": f"{equity:.2f}"}
+
+    def open_orders(self) -> dict:
+        self._simulate_fills()
+        return {"open": {txid: {} for txid in self._orders}}
+
+    def add_order(self, pair: str, side: str, volume: str, price: str,
+                  ordertype: str = "limit", oflags: str = "post") -> dict:
+        global _trade_rate_limiter
+        if _trade_rate_limiter and not _trade_rate_limiter.can_trade():
+            return {}
+        txid = self._next_txid()
+        vol = float(volume)
+        if ordertype == "market":
+            px = self._mid()
+            cost = vol * px
+            fee = cost * self.taker_fee
+            if side == "buy":
+                self._usd -= cost + fee
+                self._eth += vol
+            else:
+                self._usd += cost - fee
+                self._eth -= vol
+            self.fees_paid += fee
+            self._closed.append({"type": side, "price_filled": px, "volume": vol,
+                                 "fee": fee, "status": "closed"})
+            self.log.info("[DRY] Market %s %.6f ETH @ ~$%.2f (fee $%.3f)", side, vol, px, fee)
+        else:
+            self._orders[txid] = {"type": side, "price": float(price), "volume": vol,
+                                  "_txid": txid}
+            self.log.info("[DRY] Limit %s %.6f ETH @ $%s  [%s]", side, vol, price, txid)
+        if _trade_rate_limiter:
+            _trade_rate_limiter.record_trade()
+        return {"txid": [txid]}
+
+    def add_market_order(self, pair: str, side: str, volume: str) -> dict:
+        return self.add_order(pair, side, volume, "0", ordertype="market")
+
+    def cancel_order(self, txid: str) -> dict:
+        self._orders.pop(txid, None)
+        return {"count": 1}
+
+    def cancel_all(self) -> dict:
+        self._orders.clear()
+        return {"count": 1}
+
+    def closed_orders(self) -> dict:
+        self._simulate_fills()
+        return {"closed": {f"DRY-{i}": o for i, o in enumerate(self._closed)}}
+
+    def query_orders(self, txids: list[str]) -> dict:
+        self._simulate_fills()
+        result = {}
+        for txid in txids:
+            if txid in self._orders:
+                result[txid] = {"status": "open", "descr": self._orders[txid]}
+            else:
+                match = [o for o in self._closed if o.get("_txid") == txid]
+                if match:
+                    result[txid] = {"status": "closed", "descr": match[0]}
+        return result
+
+    def positions_snapshot(self) -> dict:
+        """Full positions/equity state — written to positions_state.json."""
+        self._simulate_fills()
+        mid = self._mid()
+        return {
+            "timestamp": time.time(),
+            "pair": self._pair,
+            "mid": mid,
+            "usd": round(self._usd, 2),
+            "eth": round(self._eth, 6),
+            "equity": round(self._usd + self._eth * mid, 2),
+            "fees_paid": round(self.fees_paid, 4),
+            "open_orders": [
+                {"txid": t, **o} for t, o in self._orders.items()
+            ],
+            "closed_count": len(self._closed),
+        }
+
 
 # ---------------------------------------------------------------------------
 # Price Tracker — in-memory rolling price history
 # ---------------------------------------------------------------------------
+
+class ExecFeed:
+    """
+    Kraken private WebSocket execution feed (live mode only).
+
+    Authenticates via GetWebSocketsToken, subscribes to the `ownTrades`
+    channel, and calls on_fill(order_id, price, volume) for every real
+    fill — instant fill detection vs. 60-second REST polling.
+
+    Runs in a daemon thread with auto-reconnect and heartbeat; a stale
+    feed is reported via on_stale so the bot can fall back to REST
+    reconciliation instead of trusting dead data. Never touches order
+    placement — read-only execution stream.
+    """
+
+    WS_URL = "wss://ws-auth.kraken.com"
+    STALE_SECONDS = 90          # no heartbeat/message → feed considered dead
+
+    def __init__(self, api: "KrakenAPI", log: logging.Logger,
+                 on_fill=None, on_stale=None):
+        self.api = api
+        self.log = log
+        self.on_fill = on_fill          # callback(order_id, price, volume)
+        self.on_stale = on_stale        # callback() when feed goes stale
+        self._ws = None
+        self._thread = None
+        self._stop = threading.Event()
+        self._last_msg = 0.0
+        self._token = ""
+        self._stale_warned = False
+        self.fills: deque = deque(maxlen=500)  # recent fills for reconciliation
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="exec-feed")
+        self._thread.start()
+        self.log.info("[ExecFeed] ownTrades listener starting")
+
+    def stop(self):
+        self._stop.set()
+        try:
+            if self._ws:
+                self._ws.close()
+        except Exception:
+            pass
+
+    def is_alive(self) -> bool:
+        return bool(self._thread and self._thread.is_alive()
+                    and self._last_msg
+                    and (time.time() - self._last_msg) < self.STALE_SECONDS)
+
+    # -- internals ----------------------------------------------------------
+
+    def _loop(self):
+        import websocket  # websocket-client; already used by order_flow
+        backoff = 5.0
+        while not self._stop.is_set():
+            try:
+                self._token = self.api.get_ws_token()
+                if not self._token:
+                    raise RuntimeError("empty WS token")
+                self._ws = websocket.WebSocketApp(
+                    self.WS_URL,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=lambda ws, e: self.log.warning("[ExecFeed] ws error: %s", e),
+                    on_close=lambda *a: self.log.info("[ExecFeed] ws closed"),
+                )
+                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as exc:
+                self.log.warning("[ExecFeed] reconnect in %.0fs: %s", backoff, exc)
+            if self._stop.is_set():
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 120.0)
+            self._check_stale()
+
+    def _on_open(self, ws):
+        sub = {"event": "subscribe",
+               "subscription": {"name": "ownTrades", "token": self._token}}
+        ws.send(json.dumps(sub))
+        self._last_msg = time.time()
+        self._stale_warned = False
+        self.log.info("[ExecFeed] subscribed to ownTrades")
+
+    def _on_message(self, ws, raw):
+        self._last_msg = time.time()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+        # heartbeat / systemStatus frames keep the feed marked fresh
+        if isinstance(data, dict):
+            if data.get("event") == "heartbeat":
+                return
+            return
+        # ownTrades payload: [[{trade_id: {...}}, ...], "ownTrades"]
+        if isinstance(data, list) and len(data) >= 2 and data[-1] == "ownTrades":
+            for trade_block in data[0]:
+                if not isinstance(trade_block, dict):
+                    continue
+                for trade_id, t in trade_block.items():
+                    try:
+                        fill = {
+                            "trade_id": trade_id,
+                            "order_id": t.get("ordertxid", ""),
+                            "pair": t.get("pair", ""),
+                            "price": float(t.get("price", 0) or 0),
+                            "volume": float(t.get("vol", 0) or 0),
+                            "fee": float(t.get("fee", 0) or 0),
+                            "type": t.get("type", ""),
+                            "time": float(t.get("time", 0) or 0),
+                        }
+                    except (TypeError, ValueError):
+                        continue
+                    self.fills.append(fill)
+                    self.log.info("[ExecFeed] fill %s %s %s @ $%.2f (fee %.4f)",
+                                  fill["type"], fill["volume"], fill["pair"],
+                                  fill["price"], fill["fee"])
+                    if self.on_fill:
+                        try:
+                            self.on_fill(fill["order_id"], fill["price"],
+                                         fill["volume"])
+                        except Exception as exc:
+                            self.log.warning("[ExecFeed] on_fill error: %s", exc)
+
+    def _check_stale(self):
+        if self._last_msg and (time.time() - self._last_msg) > self.STALE_SECONDS:
+            if not self._stale_warned:
+                self._stale_warned = True
+                self.log.warning("[ExecFeed] feed stale — falling back to REST fills")
+                if self.on_stale:
+                    try:
+                        self.on_stale()
+                    except Exception:
+                        pass
+
 
 class PriceTracker:
     """
@@ -618,41 +977,42 @@ class MessariScanner:
         return score
 
     def _fetch_and_score(self) -> float:
+        # Messari's free v1 metrics API was deprecated (404). Use CoinGecko's
+        # free /coins/markets endpoint — same momentum signals, no key needed.
         resp = self.session.get(
-            f"{MESSARI_API}/assets/ethereum/metrics",
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={"vs_currency": "usd", "ids": "ethereum",
+                    "price_change_percentage": "1h,24h,7d"},
             timeout=15,
         )
         resp.raise_for_status()
         data = resp.json()
-        metrics = data.get("data", {})
+        if not data:
+            return 0.0
+        c = data[0]
 
-        market = metrics.get("market_data", {})
-        roi = metrics.get("roi_data", {})
-
-        # Extract momentum signals
         signals = []
 
-        # 24h price change percent
-        pct_24h = market.get("percent_change_usd_last_24_hours")
+        # 24h price change percent (±10% → ±1.0)
+        pct_24h = c.get("price_change_percentage_24h_in_currency") \
+            or c.get("price_change_percentage_24h")
         if pct_24h is not None:
-            # Normalize: ±10% maps to ±1.0
             signals.append(max(-1.0, min(1.0, pct_24h / 10.0)))
 
-        # 1h price change
-        pct_1h = market.get("percent_change_usd_last_1_hour")
+        # 1h price change (±3% → ±1.0)
+        pct_1h = c.get("price_change_percentage_1h_in_currency")
         if pct_1h is not None:
             signals.append(max(-1.0, min(1.0, pct_1h / 3.0)))
 
-        # Volume change (24h vs previous): positive = increasing volume = bullish signal
-        vol_24h = market.get("real_volume_last_24_hours")
-        vol_prev = market.get("volume_last_24_hours_overstatement_multiple")
-        if vol_24h and vol_prev and vol_prev > 0:
-            # If overstatement multiple is low, real volume is relatively high → bullish
-            vol_signal = max(-1.0, min(1.0, (1.0 - vol_prev) * 0.5))
-            signals.append(vol_signal)
+        # Volume-to-market-cap ratio: rising turnover → active market
+        vol = c.get("total_volume")
+        mcap = c.get("market_cap")
+        if vol and mcap and mcap > 0:
+            turnover = vol / mcap  # ~0.02-0.15 typical
+            signals.append(max(-1.0, min(1.0, (turnover - 0.05) * 10)))
 
-        # 7d ROI
-        pct_7d = roi.get("percent_change_last_1_week")
+        # 7d price change (±15% → ±1.0)
+        pct_7d = c.get("price_change_percentage_7d_in_currency")
         if pct_7d is not None:
             signals.append(max(-1.0, min(1.0, pct_7d / 15.0)))
 
@@ -944,17 +1304,17 @@ class GridStrategy:
         for i in range(1, half + 1):
             buy_price = mid_price * (1 - self.spacing_pct * i)
             volume = usd_per_level / buy_price
-            orders.append({"side": "buy", "price": f"{buy_price:.2f}", "volume": f"{volume:.6f}"})
+            orders.append({"side": "buy", "price": f"{buy_price:.8f}", "volume": f"{volume:.8f}"})
 
         for i in range(1, half + 1):
             sell_price = mid_price * (1 + self.spacing_pct * i)
             volume = usd_per_level / sell_price
-            orders.append({"side": "sell", "price": f"{sell_price:.2f}", "volume": f"{volume:.6f}"})
+            orders.append({"side": "sell", "price": f"{sell_price:.8f}", "volume": f"{volume:.8f}"})
 
         if levels % 2 == 1:
             extra_price = mid_price * (1 - self.spacing_pct * 0.5)
             volume = usd_per_level / extra_price
-            orders.append({"side": "buy", "price": f"{extra_price:.2f}", "volume": f"{volume:.6f}"})
+            orders.append({"side": "buy", "price": f"{extra_price:.8f}", "volume": f"{volume:.8f}"})
 
         return orders
 
@@ -975,8 +1335,18 @@ class GridStrategy:
                     self.log.info("  → %s %s ETH @ $%s  [%s]",
                                   order["side"], order["volume"], order["price"], txid)
             else:
-                self.log.warning("  ✗ Failed to place %s @ $%s", order["side"], order["price"])
-            time.sleep(1)
+                # Rate limiter may have blocked it — wait just past the min interval and retry once
+                wait = getattr(_trade_rate_limiter, "min_interval_sec", 2) + 0.5
+                time.sleep(wait)
+                result = self.api.add_order(self.pair, order["side"], order["volume"], order["price"])
+                if result and "txid" in result:
+                    for txid in result["txid"]:
+                        self.active_orders[txid] = order
+                        self.log.info("  → %s %s ETH @ $%s  [%s] (retry)",
+                                      order["side"], order["volume"], order["price"], txid)
+                else:
+                    self.log.warning("  ✗ Failed to place %s @ $%s", order["side"], order["price"])
+            time.sleep(0.4)
 
     def check_and_refresh(self, mid_price: float, balance_usd: float) -> bool:
         """Returns True if grid was refreshed."""
@@ -1098,13 +1468,24 @@ class DipBuyStrategy:
         result = self.api.open_orders()
         current_open = set(result.get("open", {}).keys()) if result else set()
         filled = set(self.tp_orders.keys()) - current_open
+        # Reconcile real fill prices when the API supports it
+        real_prices = {}
+        try:
+            qr = self.api.query_orders(list(filled)) if filled else {}
+            for txid, od in (qr or {}).items():
+                pf = od.get("descr", {}).get("price_filled") if isinstance(od, dict) else None
+                if pf:
+                    real_prices[txid] = float(pf)
+        except Exception:
+            pass
         trades = []
         for txid in filled:
             info = self.tp_orders.pop(txid)
             entry = info.get("entry_price", 0.0)
-            exit_p = float(info.get("price", 0.0))
+            exit_p = real_prices.get(txid, float(info.get("price", 0.0)))
             if entry and exit_p:
-                trades.append({"entry_price": entry, "exit_price": exit_p})
+                trades.append({"entry_price": entry, "exit_price": exit_p,
+                               "strategy": info.get("strategy", "dip")})
                 self.log.info("[Dip] ✅ TP filled: entry=$%.2f exit=$%.2f", entry, exit_p)
         return trades
 
@@ -1235,11 +1616,20 @@ class ScalpStrategy:
         result = self.api.open_orders()
         current_open = set(result.get("open", {}).keys()) if result else set()
         filled = set(self.tp_orders.keys()) - current_open
+        real_prices = {}
+        try:
+            qr = self.api.query_orders(list(filled)) if filled else {}
+            for txid, od in (qr or {}).items():
+                pf = od.get("descr", {}).get("price_filled") if isinstance(od, dict) else None
+                if pf:
+                    real_prices[txid] = float(pf)
+        except Exception:
+            pass
         trades = []
         for txid in filled:
             info = self.tp_orders.pop(txid)
             entry = info.get("entry_price", 0.0)
-            exit_p = float(info.get("price", 0.0))
+            exit_p = real_prices.get(txid, float(info.get("price", 0.0)))
             if entry and exit_p:
                 trades.append({"entry_price": entry, "exit_price": exit_p})
                 self.log.info("[Scalp] ✅ TP filled: entry=$%.2f exit=$%.2f", entry, exit_p)
@@ -1261,6 +1651,127 @@ class ScalpStrategy:
 # ---------------------------------------------------------------------------
 # Market Analyzer — detects market regime from 24h OHLC data
 # ---------------------------------------------------------------------------
+
+class SwingStrategy:
+    """
+    Swing trading — holds positions for days, targets bigger moves.
+
+    Entry: confirmed uptrend regime + pullback toward support, boosted when
+    the order-flow floor detector agrees. Exit: large TP, SL, regime flip to
+    downtrend, or max-hold timeout. Positions persist in bot_state.json so
+    they survive restarts. Outcomes feed RL + improvement engine as "swing".
+    """
+
+    def __init__(self, api: KrakenAPI, pair: str, config: dict, logger: logging.Logger):
+        self.api = api
+        self.pair = pair
+        self.log = logger
+        self.tp_pct = config.get("swing_tp_pct", 12.0) / 100.0     # +12% target
+        self.sl_pct = config.get("swing_sl_pct", 6.0) / 100.0      # -6% stop
+        self.pullback_pct = config.get("swing_pullback_pct", 4.0) / 100.0
+        self.max_hold_cycles = config.get("swing_max_hold_cycles", 1440)  # ~days
+        self.min_entry_cycles = config.get("swing_cooldown_cycles", 60)
+        self.alloc_pct = config.get("swing_alloc_pct", 0.35)
+        self.positions: dict[str, dict] = {}   # txid -> position record
+        self._last_entry_cycle = -self.min_entry_cycles
+
+    def load_positions(self, state: dict):
+        self.positions = dict(state.get("swing_positions", {}))
+
+    def save_positions(self) -> dict:
+        return dict(self.positions)
+
+    def check_exits(self, mid_price: float, regime: str) -> list[dict]:
+        """Market-order exit check each cycle. Returns closed trades."""
+        closed = []
+        result = self.api.open_orders()
+        current_open = set(result.get("open", {}).keys()) if result else set()
+        for txid, pos in list(self.positions.items()):
+            exit_p = None
+            reason = ""
+            if txid not in current_open and pos.get("tp_txid"):
+                # TP order filled
+                real = {}
+                try:
+                    qr = self.api.query_orders([pos["tp_txid"]])
+                    od = qr.get(pos["tp_txid"], {})
+                    pf = od.get("descr", {}).get("price_filled")
+                    real = float(pf) if pf else 0.0
+                except Exception:
+                    real = 0.0
+                exit_p = real or pos["tp_price"]
+                reason = "tp_filled"
+            elif mid_price <= pos["sl_price"]:
+                exit_p = mid_price
+                reason = "stop_loss"
+                if pos.get("tp_txid"):
+                    try:
+                        self.api.cancel_order(pos["tp_txid"])
+                    except Exception:
+                        pass
+            elif regime == "downtrend":
+                exit_p = mid_price
+                reason = "regime_flip"
+                if pos.get("tp_txid"):
+                    try:
+                        self.api.cancel_order(pos["tp_txid"])
+                    except Exception:
+                        pass
+            elif pos["cycles_held"] >= self.max_hold_cycles:
+                exit_p = mid_price
+                reason = "max_hold"
+                if pos.get("tp_txid"):
+                    try:
+                        self.api.cancel_order(pos["tp_txid"])
+                    except Exception:
+                        pass
+            if exit_p is not None:
+                self.positions.pop(txid)
+                closed.append({"entry_price": pos["entry_price"],
+                               "exit_price": exit_p, "strategy": "swing",
+                               "reason": reason})
+                self.log.info("[Swing] exit %s: entry=$%.2f exit=$%.2f (%s)",
+                              txid, pos["entry_price"], exit_p, reason)
+            else:
+                pos["cycles_held"] = pos.get("cycles_held", 0) + 1
+        return closed
+
+    def evaluate(self, mid_price: float, regime: str, floor_score: float,
+                 remaining_usd: float, cycle: int) -> float:
+        """Maybe open a swing position. Returns USD committed."""
+        if regime != "uptrend":
+            return 0.0
+        if cycle - self._last_entry_cycle < self.min_entry_cycles:
+            return 0.0
+        if not _trade_rate_limiter.can_trade():
+            return 0.0
+        # pullback gate: need recent dip or floor confirmation
+        if floor_score < 0.45:
+            return 0.0
+        alloc = remaining_usd * self.alloc_pct
+        if alloc < 5.0:
+            return 0.0
+        vol = alloc / mid_price
+        result = self.api.add_order(self.pair, "buy", f"{vol:.6f}",
+                                    f"{mid_price:.2f}", ordertype="market")
+        if not result or "txid" not in result:
+            return 0.0
+        _trade_rate_limiter.record_trade()
+        entry = mid_price
+        tp_price = entry * (1 + self.tp_pct)
+        tp = self.api.add_order(self.pair, "sell", f"{vol:.6f}", f"{tp_price:.2f}")
+        tp_txid = tp["txid"][0] if tp and "txid" in tp else None
+        for txid in result["txid"]:
+            self.positions[txid] = {
+                "entry_price": entry, "vol": vol, "tp_price": tp_price,
+                "tp_txid": tp_txid, "sl_price": entry * (1 - self.sl_pct),
+                "cycles_held": 0, "opened": time.time(), "floor_score": floor_score,
+            }
+        self._last_entry_cycle = cycle
+        self.log.info("[Swing] OPEN %.6f @ $%.2f | TP $%.2f | SL $%.2f | floor=%.2f",
+                      vol, entry, tp_price, entry * (1 - self.sl_pct), floor_score)
+        return alloc
+
 
 class MarketAnalyzer:
     """
@@ -2377,6 +2888,8 @@ class WarmupEngine:
                 pass
         return {}
 
+    _swing_provider = None  # set by TradingBot to inject swing positions
+
     def save_state(self, regime: str = "sideways", sentiment: float = 0.0,
                    position_size_pct: float = 100.0):
         """Save current bot state for staleness detection on next startup."""
@@ -2387,6 +2900,9 @@ class WarmupEngine:
             "sentiment": sentiment,
             "position_size_pct": position_size_pct,
         }
+        # swing positions persist across restarts — they outlive cycles
+        if self._swing_provider:
+            state["swing_positions"] = self._swing_provider()
         try:
             with open(BOT_STATE_PATH, "w") as f:
                 json.dump(state, f, indent=2)
@@ -2783,11 +3299,28 @@ class TradingBot:
         global _trade_rate_limiter
         self.cfg = config
         self.log = logger
-        self.api = KrakenAPI(config["api_key"], config["api_secret"], logger)
-        self.pair = config["pair"]
+        self.dry_run = bool(config.get("dry_run"))
+        if self.dry_run:
+            self.api = DryRunAPI(logger, starting_equity=config.get("dry_run_equity", 100.0),
+                                 pair=config.get("pair", "XETHZUSD"),
+                                 maker_fee_pct=config.get("maker_fee_pct", 0.16),
+                                 taker_fee_pct=config.get("taker_fee_pct", 0.26))
+            self.log.info("*** DRY-RUN MODE — simulated fills, live prices, no real money ***")
+        else:
+                self.api = KrakenAPI(config["api_key"], config["api_secret"], logger)
         self.stop_loss = config.get("stop_loss_equity", 60.0)
         self.take_profit = config.get("take_profit_equity", 500.0)
         self.stopped = False
+
+        # --- Multi-pair: build a context per pair ---
+        # pair format map: Kraken REST code → WS display code
+        PAIR_WS = {"XETHZUSD": "ETH/USD", "XXBTZUSD": "BTC/USD", "SOLUSD": "SOL/USD",
+                   "XBTUSD": "BTC/USD", "ETHUSD": "ETH/USD", "ADAUSD": "ADA/USD",
+                   "XRPUSD": "XRP/USD", "DOGEUSD": "DOGE/USD", "DOTUSD": "DOT/USD",
+                   "LINKUSD": "LINK/USD", "ATOMUSD": "ATOM/USD", "LTCUSD": "LTC/USD"}
+        self.pairs = config.get("pairs") or [config.get("pair", "XETHZUSD")]
+        self.pair = self.pairs[0]          # primary pair (backward compat)
+        self.pair_ws_map = {p: PAIR_WS.get(p, p) for p in self.pairs}
 
         # Initialize trade rate limiter (max 1 trade/5s, 50/hour, daily loss limit)
         _trade_rate_limiter = TradeRateLimiter(config, logger)
@@ -2798,16 +3331,39 @@ class TradingBot:
         self.enabled = parse_strategies(strategy_str) if not self.adaptive_mode else {"adaptive"}
         self.log.info("Strategy mode: %s", "ADAPTIVE" if self.adaptive_mode else ", ".join(sorted(self.enabled)))
 
-        # Price tracker (10 min rolling window)
-        self.tracker = PriceTracker(window_sec=600)
+        # --- Per-pair contexts: tracker, order-flow feed, strategies ---
+        self.ctxs: dict[str, dict] = {}
+        for p in self.pairs:
+            ctx = {"pair": p, "tracker": PriceTracker(window_sec=600), "flow": None}
+            if config.get("order_flow_enabled", False):
+                try:
+                    from order_flow import OrderFlowFeed
+                    ctx["flow"] = OrderFlowFeed(pair_ws=self.pair_ws_map.get(p, p),
+                                                pair_rest=p)
+                    ctx["flow"].start()
+                    self.log.info("[OrderFlow] Live feed started for %s (%s)",
+                                  p, ctx["flow"].mode)
+                except Exception as exc:
+                    self.log.warning("[OrderFlow] %s feed failed: %s", p, exc)
+            self.ctxs[p] = ctx
+
+        # Backward-compat handles for primary pair
+        self.tracker = self.ctxs[self.pair]["tracker"]
+        self.flow = self.ctxs[self.pair]["flow"]
 
         # Reinforcement learning layer
         self.rl = ReinforcementLearner(config, logger)
         self._cycle_count = 0
 
         if self.adaptive_mode:
-            # Adaptive mode: single orchestrator handles everything
-            self.adaptive = AdaptiveStrategy(self.api, self.pair, config, logger)
+            # Adaptive mode: one orchestrator PER PAIR
+            self.adaptives = {p: AdaptiveStrategy(self.api, p, config, logger)
+                              for p in self.pairs}
+            self.adaptive = self.adaptives[self.pair]  # primary pair compat
+            # Swing strategy per pair — long-hold positions, persistent state
+            self.swings = {p: SwingStrategy(self.api, p, config, logger)
+                           for p in self.pairs}
+            self.swing = self.swings[self.pair]
             self.grid = None
             self.dip = None
             self.scalp = None
@@ -2821,16 +3377,123 @@ class TradingBot:
         # Memory pruner
         self.pruner = MemoryPruner(config, logger, self.rl)
 
+        # Self-improvement engine — meta-learner over everything
+        self.improver = None
+        if config.get("improvement_enabled", True):
+            try:
+                from improvement_engine import ImprovementEngine
+                self.improver = ImprovementEngine(config, logger, self.rl)
+                self.log.info("[Improve] Self-improvement engine active")
+            except Exception as exc:
+                self.log.warning("[Improve] Engine failed to start: %s", exc)
+
+        # Data Engine intelligence bridge (reads data_engine_report.json)
+        self._de_report_cache: dict = {}
+        self._de_report_mtime: float = 0.0
+        self._load_data_engine_intel()
+
         # Warm-up engine
         sentiment_agg = self.adaptive.sentiment if self.adaptive else None
         analyzer = self.adaptive.analyzer if self.adaptive else None
         self.warmup = WarmupEngine(config, logger, self.api, self.pair, self.rl,
                                    sentiment_agg=sentiment_agg, analyzer=analyzer)
 
+        # Swing: restore persisted positions + wire persistence into save_state
+        if self.adaptive_mode and getattr(self, "swings", None):
+            prev = self.warmup.load_state().get("swing_positions", {})
+            for p, sw in self.swings.items():
+                sw.load_positions(prev.get(p, {}))
+            if prev:
+                self.log.info("[Swing] Restored %d open position(s)",
+                              sum(len(v) for v in prev.values()))
+            self.warmup._swing_provider = lambda: {
+                p: sw.save_positions() for p, sw in self.swings.items()}
+
     # -- Helpers --
 
-    def get_mid_price(self) -> float:
-        tick = self.api.ticker(self.pair)
+    def _load_data_engine_intel(self) -> dict:
+        """Load & cache data_engine_report.json written by data_engine.py / trainer.py."""
+        path = os.path.join(BASE_DIR, "data_engine_report.json")
+        if not os.path.exists(path):
+            return self._de_report_cache
+        try:
+            mtime = os.path.getmtime(path)
+            if mtime > self._de_report_mtime:
+                with open(path, "r", encoding="utf-8") as f:
+                    self._de_report_cache = json.load(f)
+                self._de_report_mtime = mtime
+                cw = [w.get("asset") for w in self._de_report_cache.get("consistent_winners", [])[:5]]
+                self.log.info("[DataEngine] Loaded intel (cycle=%s, closed=%s, top=%s)",
+                              self._de_report_cache.get("cycle"),
+                              self._de_report_cache.get("closed_positions"),
+                              ",".join(cw) if cw else "n/a")
+        except Exception as exc:
+            self.log.warning("[DataEngine] Intel read failed: %s", exc)
+        return self._de_report_cache
+
+    def _get_data_engine_multipliers(self, pair: str) -> dict:
+        """Compute sizing/strategy/floor adjustments from Data Engine report."""
+        rep = self._load_data_engine_intel()
+        out = {"time_mult": 1.0, "asset_mult": 1.0, "floor_boost": 0.0,
+               "strat_mult": {"grid": 1.0, "dip": 1.0, "scalp": 1.0, "floor": 1.0, "swing": 1.0},
+               "consistent_winners": [w.get("pair") for w in rep.get("consistent_winners", [])]}
+        if not rep:
+            return out
+        now = time.gmtime()
+        hr_pnl = rep.get("pnl_by_hour_utc", {}).get(str(now.tm_hour))
+        day_pnl = rep.get("pnl_by_day_of_month", {}).get(str(now.tm_mday))
+        t_mult = 1.0
+        if hr_pnl is not None:
+            t_mult *= 0.80 if hr_pnl < 0 else 1.08
+        if day_pnl is not None:
+            t_mult *= 0.85 if day_pnl < 0 else 1.05
+        out["time_mult"] = round(max(0.65, min(1.20, t_mult)), 3)
+
+        # Asset ranking lookup
+        asset_code = pair.replace("ZUSD", "").replace("USD", "")
+        if asset_code.startswith(("X", "Z")) and len(asset_code) > 3:
+            asset_code = asset_code[1:]
+        cw_pairs = {w.get("pair") for w in rep.get("consistent_winners", [])}
+        cw_assets = {w.get("asset") for w in rep.get("consistent_winners", [])}
+        if pair in cw_pairs or asset_code in cw_assets:
+            out["asset_mult"] = 1.20
+        else:
+            for r in rep.get("asset_rankings", []):
+                if r.get("pair") == pair or r.get("asset") == asset_code:
+                    out["asset_mult"] = 1.10 if r.get("pnl", 0) > 0 else 0.85
+                    break
+
+        # Floor accuracy lookup
+        fa = rep.get("floor_accuracy", {}).get(asset_code)
+        if fa and fa.get("floors", 0) >= 2:
+            rate = fa.get("rate", 0.0)
+            if rate >= 0.75:
+                out["floor_boost"] = 0.08
+            elif rate < 0.40:
+                out["floor_boost"] = -0.10
+
+        # Strategy performance lookup (supports both flat and last_month/this_month dicts)
+        strat_src = rep.get("pnl_by_strategy", {})
+        if "this_month" in strat_src:
+            strat_src = strat_src["this_month"]
+        for s in ("grid", "dip", "scalp", "floor", "swing"):
+            st = strat_src.get(s)
+            if isinstance(st, dict) and st.get("trades", 0) >= 10:
+                out["strat_mult"][s] = 1.15 if st.get("pnl", 0) > 0 else 0.65
+        return out
+
+    def get_mid_price(self, pair: Optional[str] = None) -> float:
+        # Fast path: use the live WebSocket order book mid (real-time, no HTTP)
+        p = pair or self.pair
+        flow = getattr(self, "flow", None)
+        if flow and p == self.pair:
+            ws_mid = flow.book.mid()
+            age = time.time() - getattr(flow.book, "last_update", 0)
+            if ws_mid and age < 30:
+                self.log.debug("WS mid=%.2f (age %.1fs)", ws_mid, age)
+                return ws_mid
+        # Fallback: REST ticker
+        tick = self.api.ticker(p)
         info = next(iter(tick.values()))
         ask = float(info["a"][0])
         bid = float(info["b"][0])
@@ -2869,23 +3532,37 @@ class TradingBot:
             self._emergency_stop()
             return False
 
-        # 2. Fetch current price and record it
-        mid_price = self.get_mid_price()
-        self.tracker.record(mid_price)
-        self.log.info("Price: $%.2f | Equity: $%.2f | History: %d samples | RL trades: %d",
-                      mid_price, equity, self.tracker.count(),
-                      sum(self.rl.strategy_trades.values()))
+        # 2. Fetch prices per pair and record them
+        prices = {}
+        for p in self.pairs:
+            try:
+                prices[p] = self.get_mid_price(p)
+            except Exception as exc:
+                self.log.error("Price fetch failed for %s: %s", p, exc)
+                prices[p] = None
+        for p, px in prices.items():
+            if px:
+                self.ctxs[p]["tracker"].record(px)
+        mid_price = prices.get(self.pair)
+        self.log.info("Prices: %s | Equity: $%.2f | RL trades: %d",
+                      " ".join(f"{p}=${px:.2f}" for p, px in prices.items() if px),
+                      equity, sum(self.rl.strategy_trades.values()))
 
         # 3. Calculate available balance (90% of equity for safety margin)
         total_available = equity * 0.90
 
-        # --- Adaptive mode ---
+        # --- Adaptive mode: iterate every pair ---
         if self.adaptive_mode and self.adaptive:
-            # Pass the tracker to the adaptive strategy's dip/scalp sub-strategies
-            self.adaptive.dip.tracker_ref = self.tracker
-            self.adaptive.scalp.tracker_ref = self.tracker
-            # Override the None tracker in run_cycle calls
-            self._run_adaptive_cycle(mid_price, equity, total_available)
+            budget_per_pair = total_available / max(1, len(self.pairs))
+            for p in self.pairs:
+                if prices.get(p) is None:
+                    continue
+                self.tracker = self.ctxs[p]["tracker"]
+                self.flow = self.ctxs[p]["flow"]
+                self.adaptive = self.adaptives[p]
+                self.pair = p
+                self._run_adaptive_cycle(prices[p], equity, budget_per_pair)
+            self._write_positions_state()
             return True
 
         # --- Manual mode ---
@@ -2933,7 +3610,25 @@ class TradingBot:
     def _run_adaptive_cycle(self, mid_price: float, equity: float, total_available: float):
         """Run one adaptive cycle, passing tracker to sub-strategies."""
         adaptive = self.adaptive
+        prev_regime = adaptive._current_regime
         adaptive._update_regime(mid_price)
+
+        # Risk-off: on confirmed flip to downtrend, cut half the inventory
+        # at market — verified in backtests to cut bear-market bleed ~4x
+        if prev_regime and adaptive._current_regime == "downtrend" \
+                and prev_regime != "downtrend":
+            try:
+                held = self.api.asset_balance(self.pair)
+                if held > 0:
+                    vol = held * 0.5
+                    if _trade_rate_limiter.can_trade():
+                        self.api.add_order(self.pair, "sell", f"{vol:.6f}",
+                                           f"{mid_price:.2f}", ordertype="market")
+                        _trade_rate_limiter.record_trade()
+                        self.log.info("[RiskOff] Downtrend confirmed — sold %.6f ETH "
+                                      "(50%% inventory) @ $%.2f", vol, mid_price)
+            except Exception as exc:
+                self.log.warning("[RiskOff] failed: %s", exc)
 
         # Get sentiment-based position size multiplier
         size_mult = adaptive.get_polymarket_size_multiplier()
@@ -2952,15 +3647,74 @@ class TradingBot:
         vol = self.tracker.volatility(lookback_sec=120) or 0.5
 
         # RL: check for completed trades and record them
+        flow_score = 0.0
+        if self.flow:
+            try:
+                flow_score = self.flow.latest_state().get("composite_score", 0.0)
+            except Exception:
+                pass
         if self.rl.enabled:
             dip_fills = adaptive.dip.check_tp_fills()
             for fill in dip_fills:
-                self.rl.record_trade("dip", fill["entry_price"], fill["exit_price"],
+                strat = fill.get("strategy", "dip")
+                pnl_pct = (fill["exit_price"] - fill["entry_price"]) / fill["entry_price"] * 100.0
+                self.rl.record_trade(strat, fill["entry_price"], fill["exit_price"],
                                      regime, sentiment, vol)
+                if self.improver:
+                    self.improver.record_outcome(strat, pnl_pct, flow_score, regime, sentiment)
+                # floor memory: teach the engine which levels held
+                if strat == "floor" and self.flow:
+                    try:
+                        self.flow.record_floor_outcome(fill["entry_price"],
+                                                       pnl_pct > 0, pnl_pct)
+                    except Exception:
+                        pass
             scalp_fills = adaptive.scalp.check_tp_fills()
             for fill in scalp_fills:
+                pnl_pct = (fill["exit_price"] - fill["entry_price"]) / fill["entry_price"] * 100.0
                 self.rl.record_trade("scalp", fill["entry_price"], fill["exit_price"],
                                      regime, sentiment, vol)
+                if self.improver:
+                    self.improver.record_outcome("scalp", pnl_pct, flow_score, regime, sentiment)
+            # Swing exits: TP fills, stop-losses, regime flips, timeouts
+            sw = self.swings.get(self.pair) if getattr(self, "swings", None) else None
+            if sw:
+                for fill in sw.check_exits(mid_price, regime):
+                    pnl_pct = (fill["exit_price"] - fill["entry_price"]) / fill["entry_price"] * 100.0
+                    self.rl.record_trade("swing", fill["entry_price"], fill["exit_price"],
+                                         regime, sentiment, vol)
+                    if self.improver:
+                        self.improver.record_outcome("swing", pnl_pct, flow_score,
+                                                     regime, sentiment)
+                    self.log.info("[Swing] closed (%s) pnl=%+.2f%%",
+                                  fill.get("reason", "?"), pnl_pct)
+
+        # Order flow: gate entries on book pressure; scale size by composite score
+        flow_mult = 1.0
+        flow_block = False
+        if self.flow:
+            try:
+                fs = self.flow.latest_state()
+                score = fs.get("composite_score", 0.0)
+                flow_mult = max(0.5, min(1.25, 1.0 + score * 0.5))
+                if score <= -0.40:
+                    flow_block = True
+                    if self.improver:
+                        self.improver.record_blocked_entry("dip/scalp", score, mid_price)
+                self.log.info("[OrderFlow] OBI=%+.3f CVD=%+.2f score=%+.3f → %s (size x%.2f%s)",
+                              fs.get("obi_10lvl", 0), fs.get("cvd_5min_eth", 0), score,
+                              fs.get("signal"), flow_mult, " | ENTRIES BLOCKED" if flow_block else "")
+            except Exception as exc:
+                self.log.warning("[OrderFlow] state read failed: %s", exc)
+        size_mult *= flow_mult
+
+        # Data Engine intel: apply time-of-day, asset ranking, strategy & floor multipliers
+        de_intel = self._get_data_engine_multipliers(self.pair)
+        de_comb = de_intel["time_mult"] * de_intel["asset_mult"]
+        size_mult *= de_comb
+        self.log.info("[DataEngine] %s time_mult=%.2fx asset_mult=%.2fx floor_boost=%+.2f",
+                      self.pair, de_intel["time_mult"], de_intel["asset_mult"],
+                      de_intel["floor_boost"])
 
         # RL: get strategy capital allocation weights
         rl_weights = self.rl.select_strategy_weights()
@@ -2975,13 +3729,25 @@ class TradingBot:
             if "dip_threshold_pct" in rl_params:
                 adaptive.dip.dip_threshold_pct = rl_params["dip_threshold_pct"]
 
+        # Exposure cap: no new entries when >60% of equity is already in asset
+        can_enter = True
+        try:
+            held_asset = self.api.asset_balance(self.pair)
+            exposure = (held_asset * mid_price) / equity if equity > 0 else 1.0
+            can_enter = exposure < 0.60
+            if not can_enter:
+                self.log.info("[Risk] Exposure %.0f%% — new entries paused",
+                              exposure * 100)
+        except Exception:
+            pass
+
         committed = 0.0
 
         # --- Grid Strategy ---
         if "grid" in adaptive.active:
             grid_alloc_pct = self.cfg.get("grid_alloc_pct", 60.0) / 100.0
-            # RL adjusts capital allocation
-            rl_grid_mult = rl_weights.get("grid", 0.34) / 0.34  # relative to baseline
+            # RL + DataEngine adjusts capital allocation
+            rl_grid_mult = (rl_weights.get("grid", 0.34) / 0.34) * de_intel["strat_mult"]["grid"]
             pattern_mult = self.rl.get_pattern_multiplier("grid", regime, sentiment, vol)
             grid_budget = total_available * grid_alloc_pct * size_mult * max(0.5, min(1.5, rl_grid_mult * pattern_mult))
             adaptive.grid.check_and_refresh(mid_price, grid_budget)
@@ -2994,26 +3760,80 @@ class TradingBot:
         remaining = (total_available - committed) * size_mult
 
         # --- Dip Buy ---
-        if "dip" in adaptive.active and remaining > 5.0:
+        if "dip" in adaptive.active and remaining > 5.0 and not flow_block and can_enter:
             pattern_mult = self.rl.get_pattern_multiplier("dip", regime, sentiment, vol)
-            rl_dip_mult = rl_weights.get("dip", 0.33) / 0.33
+            rl_dip_mult = (rl_weights.get("dip", 0.33) / 0.33) * de_intel["strat_mult"]["dip"]
             adjusted_remaining = remaining * max(0.5, min(1.5, rl_dip_mult * pattern_mult))
             used = adaptive.dip.evaluate(mid_price, self.tracker, adjusted_remaining)
             committed += used
             remaining -= used
 
         # --- Scalp: new entries ---
-        if "scalp" in adaptive.active and remaining > 5.0:
+        if "scalp" in adaptive.active and remaining > 5.0 and not flow_block and can_enter:
             pattern_mult = self.rl.get_pattern_multiplier("scalp", regime, sentiment, vol)
-            rl_scalp_mult = rl_weights.get("scalp", 0.33) / 0.33
+            rl_scalp_mult = (rl_weights.get("scalp", 0.33) / 0.33) * de_intel["strat_mult"]["scalp"]
             adjusted_remaining = remaining * max(0.5, min(1.5, rl_scalp_mult * pattern_mult))
             used = adaptive.scalp.evaluate(mid_price, self.tracker, adjusted_remaining)
             committed += used
+
+        # --- Floor Buy: order-flow confirmed market bottom ---
+        # Fires when the live book shows capitulation + CVD divergence +
+        # bid-wall support + absorption. Cooldown so we don't stack entries.
+        if self.flow and remaining > 5.0 and can_enter and self.cfg.get("floor_enabled", True):
+            try:
+                fscore = self.flow.floor_score() + de_intel["floor_boost"]
+                cooldown = self.cfg.get("floor_cooldown_cycles", 30)
+                if fscore >= self.cfg.get("floor_threshold", 0.65) and \
+                        self._cycle_count - getattr(self, "_last_floor_cycle", -cooldown) >= cooldown:
+                    floor_alloc = remaining * self.cfg.get("floor_alloc_pct", 0.30)
+                    if floor_alloc >= 5.0 and _trade_rate_limiter.can_trade():
+                        vol = floor_alloc / mid_price
+                        result = self.api.add_order(self.pair, "buy", f"{vol:.6f}",
+                                                    f"{mid_price:.2f}", ordertype="market")
+                        if result and "txid" in result:
+                            _trade_rate_limiter.record_trade()
+                            self._last_floor_cycle = self._cycle_count
+                            tp_price = mid_price * (1 + self.cfg.get("floor_tp_pct", 4.0) / 100.0)
+                            tp = self.api.add_order(self.pair, "sell", f"{vol:.6f}",
+                                                    f"{tp_price:.2f}")
+                            if tp and "txid" in tp:
+                                for txid in tp["txid"]:
+                                    adaptive.dip.tp_orders[txid] = {
+                                        "price": tp_price, "entry_price": mid_price,
+                                        "strategy": "floor"}
+                            committed += floor_alloc
+                            self.log.info("[Floor] FLOOR BUY score=%.2f — bought %.6f @ $%.2f, TP $%.2f",
+                                          fscore, vol, mid_price, tp_price)
+            except Exception as exc:
+                self.log.warning("[Floor] check failed: %s", exc)
+
+        # --- Swing: new entries (uptrend + pullback/floor confirmation) ---
+        sw = self.swings.get(self.pair) if getattr(self, "swings", None) else None
+        if sw and remaining > 5.0 and not flow_block and can_enter:
+            try:
+                fscore = (self.flow.floor_score() if self.flow else 0.0) + de_intel["floor_boost"]
+                pattern_mult = self.rl.get_pattern_multiplier("swing", regime, sentiment, vol)
+                rl_swing_mult = (rl_weights.get("swing", 0.33) / 0.33) * de_intel["strat_mult"]["swing"]
+                swing_budget = remaining * max(0.5, min(1.5, rl_swing_mult * pattern_mult))
+                used = sw.evaluate(mid_price, regime, fscore, swing_budget,
+                                   self._cycle_count)
+                committed += used
+                remaining -= used
+            except Exception as exc:
+                self.log.warning("[Swing] evaluate failed: %s", exc)
 
         # RL dashboard every 10 cycles
         self._cycle_count += 1
         if self._cycle_count % 10 == 0:
             self.rl.log_dashboard()
+
+        # Self-improvement: analyze this cycle (heavy pass every N cycles)
+        if self.improver:
+            try:
+                fs = self.flow.latest_state() if self.flow else None
+                self.improver.analyze_cycle(fs, mid_price)
+            except Exception as exc:
+                self.log.warning("[Improve] analysis failed: %s", exc)
 
         # Memory pruning check (end of cycle, no active trades in progress)
         self.pruner.maybe_prune()
@@ -3024,6 +3844,54 @@ class TradingBot:
             sentiment=sentiment,
             position_size_pct=rampup_mult * 100,
         )
+
+    def _write_positions_state(self):
+        """Write positions_state.json each cycle — the terminal reads this."""
+        try:
+            if isinstance(self.api, DryRunAPI):
+                snap = self.api.positions_snapshot()
+            else:
+                # Live mode: build from real balance + open orders
+                bal = self.api.balance()
+                oo = self.api.open_orders()
+                snap = {
+                    "timestamp": time.time(),
+                    "pair": self.pair,
+                    "mid": self.get_mid_price(),
+                    "usd": float(bal.get("ZUSD", 0)),
+                    "equity": self.get_equity(),
+                    "open_orders": [{"txid": t} for t in oo.get("open", {})],
+                    "closed_count": None,
+                }
+            snap["pairs"] = self.pairs
+            snap["strategies_active"] = {
+                p: sorted(self.adaptives[p].active) if self.adaptive_mode else sorted(self.enabled)
+                for p in self.pairs
+            }
+            snap["data_engine_intel"] = self._get_data_engine_multipliers(self.pair)
+            with open(os.path.join(BASE_DIR, "positions_state.json"), "w") as f:
+                json.dump(snap, f, indent=2)
+        except Exception as exc:
+            self.log.warning("positions_state write failed: %s", exc)
+
+    def _on_ws_fill(self, order_id: str, price: float, volume: float):
+        """Instant fill notification from the ownTrades WS feed (live mode)."""
+        self.log.info("[ExecFeed] order %s filled @ $%.2f x%.6f",
+                      order_id, price, volume)
+        # Record into trade history so RL/improvement learn from real fills
+        self.history.append({
+            "time": time.time(), "strategy": "ws_fill",
+            "order_id": order_id, "price": price, "volume": volume,
+        })
+
+    def reconcile_fills(self, txids: list[str]) -> dict[str, dict]:
+        """Query real fill prices for closed txids — honest PnL."""
+        try:
+            result = self.api.query_orders(txids)
+            return result if isinstance(result, dict) else {}
+        except Exception as exc:
+            self.log.warning("Fill reconciliation failed: %s", exc)
+            return {}
 
     def _emergency_stop(self):
         """Cancel everything across all strategies."""
@@ -3040,6 +3908,8 @@ class TradingBot:
             if self.dip:
                 self.dip.tp_orders.clear()
         self.stopped = True
+        if getattr(self, "_exec_feed", None):
+            self._exec_feed.stop()
 
     def run(self, once: bool = False):
         """Main loop."""
@@ -3054,6 +3924,15 @@ class TradingBot:
 
         # Run warm-up sequence before main loop
         self.warmup.run_warmup(pruner=self.pruner)
+
+        # Live mode: start private WS execution feed (ownTrades → instant fills)
+        self._exec_feed = None
+        if not self.dry_run:
+            self._exec_feed = ExecFeed(self.api, logger,
+                                       on_fill=self._on_ws_fill,
+                                       on_stale=lambda: setattr(self, "_ws_fills_stale", True))
+            self._ws_fills_stale = False
+            self._exec_feed.start()
 
         try:
             while True:
@@ -3078,6 +3957,9 @@ class TradingBot:
             self.log.info("Interrupted — cancelling all orders…")
             self._emergency_stop()
             self.log.info("Shutdown complete.")
+        finally:
+            if self._exec_feed:
+                self._exec_feed.stop()
 
 
 # ---------------------------------------------------------------------------
