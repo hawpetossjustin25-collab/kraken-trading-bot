@@ -370,7 +370,7 @@ class Trainer(DataEngine):
         open(REPORT_MD, "w", encoding="utf-8").write("\n".join(lines))
 
 
-if __name__ == "__main__":
+def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=int, default=240,
                     help="candle minutes (240 = 4h candles covering 120 days)")
@@ -379,3 +379,7 @@ if __name__ == "__main__":
                     help="min 24h USD volume filter (0 = all 628 pairs)")
     a = ap.parse_args()
     Trainer(a.pairs, min_24h_usd=a.min_vol).compare_months(interval=a.interval)
+
+
+if __name__ == "__main__":
+    main()
